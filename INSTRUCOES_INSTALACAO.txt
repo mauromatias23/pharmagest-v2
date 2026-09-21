@@ -1,0 +1,38 @@
+============================================================
+GUIA DE INSTALACAO - PHARMAGEST ANGOLA (MODO OFFLINE)
+============================================================
+
+O PharmaGest foi desenhado para ser resiliente e funcionar sem internet,
+utilizando o banco de dados interno do seu navegador (IndexedDB).
+
+PASSO A PASSO PARA INSTALACAO:
+
+1. INSTALAR O MOTOR (NODE.JS):
+   - Aceda a: https://nodejs.org/
+   - Descarregue a versao "LTS" (Recomendado para a maioria).
+   - Instale seguindo todos os passos "Next" ate ao fim.
+
+2. PREPARAR A PASTA DO SISTEMA:
+   - Coloque todos os ficheiros do sistema numa pasta segura (ex: C:\PharmaGest).
+
+3. INICIAR O SISTEMA:
+   - Clique duas vezes no ficheiro: "Ligar_Sistema.bat"
+   - Na primeira vez, ele vai demorar cerca de 1 minuto para baixar as 
+     bibliotecas necessarias (apenas na primeira execucao).
+   - O sistema abrira automaticamente no seu Chrome ou Edge.
+
+4. ACESSO AO SISTEMA (SENHAS PADRAO):
+   - Administrador: 1111
+   - Funcionario 1: 2222
+   - Funcionario 2: 3333
+
+------------------------------------------------------------
+NOTAS IMPORTANTES SOBRE OS DADOS (INDEXEDDB):
+------------------------------------------------------------
+- Onde estao os dados? Estao guardados de forma segura dentro do 
+  perfil do seu navegador.
+- Cuidado: Se formatar o computador ou fizer "Limpar Dados do Navegador" 
+  incluindo "Cookies e outros dados de sites", podera perder as faturas.
+- Backup: O sistema permite exportar faturas em PDF. Recomendamos
+  gerar o PDF do "Mapa de IVA" ou "Historico" semanalmente como copia.
+============================================================

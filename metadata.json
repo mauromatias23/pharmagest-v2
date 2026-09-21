@@ -1,0 +1,10 @@
+{
+  "name": "PharmaGest-Angola",
+  "description": "Sistema completo para farmácias com conformidade AGT/MINSA, controlo de lotes, validade e faturação fiscal angolana.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
