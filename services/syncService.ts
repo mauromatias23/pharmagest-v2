@@ -196,15 +196,29 @@ export const SyncService = {
   },
 
   /**
-   * Resumo de dados pendentes locais (ex: vendas de 11 a 21 de setembro).
+   * Resumo de dados pendentes locais (ex: vendas de setembro / qualquer período).
    */
   async getPendingSyncSummary(): Promise<{ totalInvoices: number; unsyncedInvoices: number; periodInvoices: number }> {
     try {
       const allInvoices = await db.invoices.toArray();
       const unsynced = allInvoices.filter(i => !i.synchronized);
       const periodInvoices = allInvoices.filter(i => {
-        const d = (i.date || '').slice(0, 10);
-        return d >= '2026-09-11' && d <= '2026-09-21';
+        if (!i.date) return false;
+        // Suporte a datas ISO "2026-09-15T...", datas locais "2026-09-15" ou timestamp
+        try {
+          const dt = new Date(i.date);
+          if (isNaN(dt.getTime())) {
+            const str = String(i.date);
+            return str.includes('2026-09-') || str.includes('/09/2026') || str.includes('09-2026');
+          }
+          const y = dt.getFullYear();
+          const m = dt.getMonth() + 1; // 9 = Setembro
+          const d = dt.getDate();
+          return y === 2026 && m === 9 && d >= 11 && d <= 21;
+        } catch {
+          const dStr = (i.date || '').slice(0, 10);
+          return dStr >= '2026-09-11' && dStr <= '2026-09-21';
+        }
       });
       return {
         totalInvoices: allInvoices.length,
@@ -214,6 +228,49 @@ export const SyncService = {
     } catch {
       return { totalInvoices: 0, unsyncedInvoices: 0, periodInvoices: 0 };
     }
+  },
+
+  /**
+   * Exporta todas as faturas locais para um ficheiro JSON para transferir de um computador/link para outro.
+   */
+  async exportLocalDataToJSON(): Promise<{ invoices: any[]; closures: any[] }> {
+    const invoices = await db.invoices.toArray();
+    const closures = await db.dailyClosures.toArray();
+    return { invoices, closures };
+  },
+
+  /**
+   * Importa faturas e fechos de um ficheiro JSON para a base de dados local deste navegador.
+   */
+  async importLocalDataFromJSON(data: { invoices?: any[]; closures?: any[] }): Promise<{ importedInvoices: number; importedClosures: number }> {
+    let importedInvoices = 0;
+    let importedClosures = 0;
+
+    if (data.invoices && Array.isArray(data.invoices) && data.invoices.length > 0) {
+      for (const inv of data.invoices) {
+        try {
+          // Marca como pendente de sincronização para garantir que é enviado para o Supabase
+          await db.invoices.put({ ...inv, synchronized: false });
+          importedInvoices++;
+        } catch (e) {
+          console.warn('[importLocalDataFromJSON] Erro ao importar fatura:', e);
+        }
+      }
+    }
+
+    if (data.closures && Array.isArray(data.closures) && data.closures.length > 0) {
+      for (const c of data.closures) {
+        try {
+          await db.dailyClosures.put({ ...c, synchronized: false });
+          importedClosures++;
+        } catch (e) {
+          console.warn('[importLocalDataFromJSON] Erro ao importar fecho:', e);
+        }
+      }
+    }
+
+    this.broadcastLocalChange();
+    return { importedInvoices, importedClosures };
   },
 
   /**

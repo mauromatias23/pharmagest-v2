@@ -617,6 +617,7 @@ END $$;
                   </div>
 
                   {/* Botões de Ação */}
+                  {/* Botões de Ação */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <button
                       onClick={handlePushLocalOnly}
@@ -635,6 +636,62 @@ END $$;
                       <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
                       {isSyncing ? 'A Sincronizar Tudo...' : 'Sincronizar Tudo (Upload + Download)'}
                     </button>
+                  </div>
+
+                  {/* Transferência entre Computadores / Links Diferentes (Exportar / Importar Backup JSON) */}
+                  <div className="pt-2 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs">
+                    <div className="text-slate-500 text-[11px] text-center sm:text-left">
+                      <span className="font-bold text-slate-700 block">Vendeu noutro link ou computador?</span>
+                      Exporte o backup local daquele navegador e importe aqui para lançar na nuvem.
+                    </div>
+                    <div className="flex items-center gap-2 w-full sm:w-auto">
+                      <button
+                        onClick={async () => {
+                          try {
+                            const data = await SyncService.exportLocalDataToJSON();
+                            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = `backup-vendas-locais-${new Date().toISOString().slice(0, 10)}.json`;
+                            a.click();
+                            URL.revokeObjectURL(url);
+                          } catch (e: any) {
+                            alert('Erro ao exportar backup: ' + (e?.message || e));
+                          }
+                        }}
+                        className="flex-1 sm:flex-initial px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold text-[11px] flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                        title="Baixar ficheiro com as faturas deste navegador"
+                      >
+                        <DownloadCloud className="w-3.5 h-3.5" />
+                        Exportar Backup (.json)
+                      </button>
+
+                      <label className="flex-1 sm:flex-initial px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold text-[11px] flex items-center justify-center gap-1.5 transition-colors cursor-pointer">
+                        <UploadCloud className="w-3.5 h-3.5" />
+                        Importar Backup
+                        <input
+                          type="file"
+                          accept=".json"
+                          className="hidden"
+                          onChange={async (e) => {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+                            try {
+                              const text = await file.text();
+                              const json = JSON.parse(text);
+                              const res = await SyncService.importLocalDataFromJSON(json);
+                              alert(`Backup importado com sucesso! ${res.importedInvoices} faturas prontas para envio.`);
+                              await loadPendingStats();
+                              if (onSyncSuccess) onSyncSuccess();
+                            } catch (err: any) {
+                              alert('Erro ao carregar ficheiro de backup: ' + (err?.message || err));
+                            }
+                            e.target.value = '';
+                          }}
+                        />
+                      </label>
+                    </div>
                   </div>
 
                   {/* Sync Result Block */}
