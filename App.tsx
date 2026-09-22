@@ -549,7 +549,7 @@ const App: React.FC = () => {
           onDeleteUser={handleDeleteUser}
         />
       )}
-      {activeTab === 'recovery_sales' && (
+      {activeTab === 'recovery_sales' && currentUser.role === UserRole.ADMIN && (
         <RecoveryBilling 
           user={currentUser}
           products={products}

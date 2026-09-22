@@ -36,7 +36,7 @@ const Layout: React.FC<LayoutProps> = ({ user, onLogout, activeTab, setActiveTab
     { id: 'inventory', label: 'Stock & Validades', icon: Package, roles: [UserRole.ADMIN, UserRole.PHARMACIST, UserRole.CASHIER] }, // Funcionários podem ver stock
     { id: 'reports', label: 'Relatórios', icon: FileBarChart, roles: [UserRole.ADMIN, UserRole.PHARMACIST] },
     { id: 'users', label: 'Utilizadores', icon: Users, roles: [UserRole.ADMIN] },
-    { id: 'recovery_sales', label: 'Recuperar Vendas Antiga', icon: History, roles: [UserRole.ADMIN, UserRole.PHARMACIST, UserRole.CASHIER] },
+    { id: 'recovery_sales', label: 'Recuperar Vendas Antiga', icon: History, roles: [UserRole.ADMIN] },
   ];
 
   const allowedMenuItems = menuItems.filter(item => item.roles.includes(user.role));
