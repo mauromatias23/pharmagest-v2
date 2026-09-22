@@ -1,6 +1,6 @@
 
 import Dexie, { type Table } from 'dexie';
-import { User, Product, Batch, Invoice } from '../types';
+import { User, Product, Batch, Invoice, SyncOperation, StockMovement, Purchase, PurchaseItem, Expense, OtherIncome } from '../types';
 import { INITIAL_USERS } from './mockData';
 import { isSupabaseConfigured } from './supabaseClient';
 
@@ -20,6 +20,8 @@ export interface ShiftBreakdown {
 
 export interface DailyClosure {
   id: string;
+  operationId?: string;
+  deviceId?: string;
   date: string;
   userId: string;
   userName: string;
@@ -43,22 +45,34 @@ export interface DeletedRecord {
   timestamp: number;
 }
 
+export interface AppSetting {
+  key: string;
+  value: any;
+  updatedAt: string;
+}
+
 /**
  * PharmaDatabase handles local storage via IndexedDB (Dexie).
  */
 export class PharmaDatabase extends Dexie {
-  // Use '!' to tell TypeScript these will be initialized by Dexie
   users!: Table<User, string>;
   products!: Table<Product, string>;
   batches!: Table<Batch, string>;
   invoices!: Table<Invoice & { synchronized?: boolean }, string>;
   dailyClosures!: Table<DailyClosure, string>;
   deletedRecords!: Table<DeletedRecord, string>;
+  syncQueue!: Table<SyncOperation, number>;
+  stockMovements!: Table<StockMovement, string>;
+  purchases!: Table<Purchase, string>;
+  purchaseItems!: Table<PurchaseItem, string>;
+  expenses!: Table<Expense, string>;
+  otherIncomes!: Table<OtherIncome, string>;
+  appSettings!: Table<AppSetting, string>;
 
   constructor() {
     super('PharmaGestDB');
     
-    // Explicitly defining the schema for the database.
+    // Explicitly defining progressive non-destructive schema versions
     this.version(6).stores({
       users: 'id, name, role',
       products: 'id, code, name, category',
@@ -92,6 +106,39 @@ export class PharmaDatabase extends Dexie {
       invoices: 'id, invoiceNumber, date, customerNif, closed, closureId, shiftNumber, synchronized',
       dailyClosures: 'id, date, userId, type, shiftNumber, synchronized',
       deletedRecords: 'id, table, timestamp'
+    });
+
+    // Version 95: Offline-First queue, stock movements, expenses, purchases, idempotency
+    this.version(95).stores({
+      users: 'id, name, role',
+      products: 'id, code, name, category',
+      batches: 'id, productId, lotNumber, expiryDate',
+      invoices: 'id, invoiceNumber, date, customerNif, closed, closureId, shiftNumber, synchronized, operationId, deviceId',
+      dailyClosures: 'id, date, userId, type, shiftNumber, synchronized, operationId, deviceId',
+      deletedRecords: 'id, table, timestamp',
+      syncQueue: '++id, operationId, deviceId, entityType, entityId, operationType, status, createdAt',
+      stockMovements: 'id, operationId, deviceId, productId, batchId, type, date, referenceId',
+      purchases: 'id, operationId, deviceId, date, status, supplier',
+      purchaseItems: 'id, purchaseId, productId, batchId',
+      expenses: 'id, operationId, deviceId, date, category, status',
+      appSettings: 'key'
+    });
+
+    // Version 96: Add otherIncomes for complete financial flow (Entradas / Saídas)
+    this.version(96).stores({
+      users: 'id, name, role',
+      products: 'id, code, name, category',
+      batches: 'id, productId, lotNumber, expiryDate',
+      invoices: 'id, invoiceNumber, date, customerNif, closed, closureId, shiftNumber, synchronized, operationId, deviceId',
+      dailyClosures: 'id, date, userId, type, shiftNumber, synchronized, operationId, deviceId',
+      deletedRecords: 'id, table, timestamp',
+      syncQueue: '++id, operationId, deviceId, entityType, entityId, operationType, status, createdAt',
+      stockMovements: 'id, operationId, deviceId, productId, batchId, type, date, referenceId',
+      purchases: 'id, operationId, deviceId, date, status, supplier',
+      purchaseItems: 'id, purchaseId, productId, batchId',
+      expenses: 'id, operationId, deviceId, date, category, status, synchronized',
+      otherIncomes: 'id, operationId, deviceId, date, category, status, synchronized',
+      appSettings: 'key'
     });
   }
 

@@ -19,6 +19,7 @@ import {
   DownloadCloud
 } from 'lucide-react';
 import { SyncService } from '../services/syncService';
+import { DeviceService } from '../services/deviceService';
 import { 
   testSupabaseConnection, 
   isSupabaseConfigured,
@@ -582,32 +583,38 @@ END $$;
                       <div className="flex items-center gap-2">
                         <Database className="w-4 h-4 text-amber-600" />
                         <span className="text-xs font-black text-amber-900 uppercase tracking-wider">
-                          Vendas Locais neste Navegador (IndexedDB)
+                          Terminal Local (IndexedDB)
                         </span>
                       </div>
                       <span className="self-start sm:self-auto px-2 py-0.5 bg-amber-500/20 text-amber-800 rounded text-[10px] font-black uppercase tracking-widest font-mono">
-                        Período 11 a 21 de Setembro
+                        Terminal: {DeviceService.getDeviceId().slice(0, 15)}...
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-3 gap-2.5 text-center">
-                      <div className="bg-white/80 rounded-xl p-2.5 border border-amber-200/50">
-                        <div className="text-lg font-black text-slate-800 font-mono">
+                    <div className="grid grid-cols-4 gap-2 text-center">
+                      <div className="bg-white/80 rounded-xl p-2 border border-amber-200/50">
+                        <div className="text-base font-black text-slate-800 font-mono">
                           {pendingStats ? pendingStats.totalInvoices : '...'}
                         </div>
-                        <div className="text-[10px] font-bold text-slate-500 uppercase tracking-tight">Total Local</div>
+                        <div className="text-[9px] font-bold text-slate-500 uppercase tracking-tight">Total Local</div>
                       </div>
-                      <div className="bg-white/80 rounded-xl p-2.5 border border-amber-200/50">
-                        <div className="text-lg font-black text-amber-600 font-mono">
+                      <div className="bg-white/80 rounded-xl p-2 border border-amber-200/50">
+                        <div className="text-base font-black text-amber-600 font-mono">
                           {pendingStats ? pendingStats.unsyncedInvoices : '...'}
                         </div>
-                        <div className="text-[10px] font-bold text-amber-700 uppercase tracking-tight">Pendentes de Envio</div>
+                        <div className="text-[9px] font-bold text-amber-700 uppercase tracking-tight">Faturas Offline</div>
                       </div>
-                      <div className="bg-white/80 rounded-xl p-2.5 border border-amber-200/50">
-                        <div className="text-lg font-black text-emerald-600 font-mono">
+                      <div className="bg-white/80 rounded-xl p-2 border border-amber-200/50">
+                        <div className="text-base font-black text-purple-600 font-mono">
+                          {(pendingStats as any)?.queuePending ?? 0}
+                        </div>
+                        <div className="text-[9px] font-bold text-purple-700 uppercase tracking-tight">Fila (Queue)</div>
+                      </div>
+                      <div className="bg-white/80 rounded-xl p-2 border border-amber-200/50">
+                        <div className="text-base font-black text-emerald-600 font-mono">
                           {pendingStats ? pendingStats.periodInvoices : '...'}
                         </div>
-                        <div className="text-[10px] font-bold text-emerald-700 uppercase tracking-tight">11/09 a 21/09</div>
+                        <div className="text-[9px] font-bold text-emerald-700 uppercase tracking-tight">11/09 a 21/09</div>
                       </div>
                     </div>
 

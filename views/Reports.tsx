@@ -18,8 +18,14 @@ import {
   Activity, 
   CheckCircle,
   FileSpreadsheet,
-  Trash2
+  Trash2,
+  DollarSign,
+  Scale,
+  ArrowUpRight
 } from 'lucide-react';
+import { FrequentProductsReport } from '../components/reports/FrequentProductsReport';
+import { ExpensesReport } from '../components/reports/ExpensesReport';
+import { FinancialFlowReport } from '../components/reports/FinancialFlowReport';
 
 interface ReportsProps {
   user: User;
@@ -50,7 +56,16 @@ type ReportType =
   | 'MOST_LEAST'
   | null;
 
-type ViewMode = 'INVOICES' | 'ITEMS' | 'SALES_REPORT' | 'STOCK_REPORT' | 'PRODUCTS_REPORT' | 'MOST_LEAST_REPORT';
+type ViewMode = 
+  | 'INVOICES' 
+  | 'ITEMS' 
+  | 'SALES_REPORT' 
+  | 'STOCK_REPORT' 
+  | 'PRODUCTS_REPORT' 
+  | 'MOST_LEAST_REPORT'
+  | 'FREQUENT_PRODUCTS'
+  | 'EXPENSES'
+  | 'FINANCIAL_FLOW';
 type SalesSubTab = 'DAILY' | 'MONTHLY' | 'YEARLY';
 type ProductPeriod = 'SEMANA' | 'MES' | 'TRIMESTRE' | 'SEMESTRE' | 'ANO';
 
@@ -218,12 +233,14 @@ const Reports: React.FC<ReportsProps> = ({
     return yearRange;
   }, [productPeriod, weekRange, monthRange, quarterRange, semesterRange, yearRange]);
 
-  // Search filter for general invoices/items
+  // Search filter for general invoices/items (ordenadas em ordem crescente dos dias e dos meses)
   const filteredInvoices = useMemo(() => {
-    return yearFilteredInvoices.filter(inv => 
-      inv.invoiceNumber.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (inv.customerName && inv.customerName.toLowerCase().includes(searchTerm.toLowerCase()))
-    );
+    return yearFilteredInvoices
+      .filter(inv => 
+        inv.invoiceNumber.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        (inv.customerName && inv.customerName.toLowerCase().includes(searchTerm.toLowerCase()))
+      )
+      .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime() || (a.invoiceNumber || '').localeCompare(b.invoiceNumber || ''));
   }, [yearFilteredInvoices, searchTerm]);
 
   // Flattened sold items with invoice info
@@ -809,6 +826,48 @@ const Reports: React.FC<ReportsProps> = ({
             <TrendingDown className="w-4 h-4" />
             Relatório Mais e Menos
           </button>
+
+          <div className="pt-2 pb-1 border-t border-slate-100">
+            <h4 className="text-[9px] font-black uppercase text-slate-400 tracking-widest px-3 mb-1.5">
+              Gestão Financeira & Rotação
+            </h4>
+          </div>
+
+          <button 
+            onClick={() => { setViewMode('FREQUENT_PRODUCTS'); setSearchTerm(''); }}
+            className={`w-full text-left px-3.5 py-3 rounded-xl text-xs font-bold transition-all flex items-center gap-3 ${
+              viewMode === 'FREQUENT_PRODUCTS' 
+                ? 'bg-indigo-600 text-white font-black shadow-md shadow-indigo-200' 
+                : 'text-slate-700 hover:bg-indigo-50/60 hover:text-indigo-900'
+            }`}
+          >
+            <Activity className="w-4 h-4 text-indigo-400" />
+            Saída Mais Frequente
+          </button>
+
+          <button 
+            onClick={() => { setViewMode('EXPENSES'); setSearchTerm(''); }}
+            className={`w-full text-left px-3.5 py-3 rounded-xl text-xs font-bold transition-all flex items-center gap-3 ${
+              viewMode === 'EXPENSES' 
+                ? 'bg-rose-600 text-white font-black shadow-md shadow-rose-200' 
+                : 'text-slate-700 hover:bg-rose-50/60 hover:text-rose-900'
+            }`}
+          >
+            <DollarSign className="w-4 h-4 text-rose-400" />
+            Despesas / Gastos
+          </button>
+
+          <button 
+            onClick={() => { setViewMode('FINANCIAL_FLOW'); setSearchTerm(''); }}
+            className={`w-full text-left px-3.5 py-3 rounded-xl text-xs font-bold transition-all flex items-center gap-3 ${
+              viewMode === 'FINANCIAL_FLOW' 
+                ? 'bg-emerald-700 text-white font-black shadow-md shadow-emerald-200' 
+                : 'text-slate-700 hover:bg-emerald-50/60 hover:text-emerald-900'
+            }`}
+          >
+            <Scale className="w-4 h-4 text-emerald-400" />
+            Entradas vs Saídas
+          </button>
         </div>
 
         {/* Dynamic Details Content Panel */}
@@ -955,7 +1014,14 @@ const Reports: React.FC<ReportsProps> = ({
                             <p className="font-bold text-slate-700">{new Date(inv.date).toLocaleDateString('pt-AO')}</p>
                             <p className="text-[10px] text-slate-400">{new Date(inv.date).toLocaleTimeString('pt-AO').substring(0, 5)}</p>
                           </td>
-                          <td className="px-5 py-3.5 font-mono font-bold text-slate-900">{inv.invoiceNumber}</td>
+                          <td className="px-5 py-3.5 font-mono font-bold text-slate-900">
+                            {inv.invoiceNumber}
+                            {(inv.isRetroactive || (inv.invoiceNumber && inv.invoiceNumber.startsWith('RET-'))) && (
+                              <span className="block text-[9px] font-black uppercase tracking-wider text-amber-800 bg-amber-50 border border-amber-300 px-1.5 py-0.5 rounded mt-0.5 w-fit">
+                                Retroativa
+                              </span>
+                            )}
+                          </td>
                           <td className="px-5 py-3.5 font-semibold text-slate-700">{inv.customerName || 'Consumidor Final'}</td>
                           <td className="px-5 py-3.5 text-right font-black text-slate-900">{inv.totalNet.toLocaleString()} Kz</td>
                           <td className="px-5 py-3.5">
@@ -1714,6 +1780,21 @@ const Reports: React.FC<ReportsProps> = ({
                 </div>
               </div>
             </div>
+          )}
+
+          {/* PRODUTOS COM SAÍDA MAIS FREQUENTE */}
+          {viewMode === 'FREQUENT_PRODUCTS' && (
+            <FrequentProductsReport invoices={invoices} products={products} />
+          )}
+
+          {/* GESTÃO DE DESPESAS / GASTOS */}
+          {viewMode === 'EXPENSES' && (
+            <ExpensesReport user={user} />
+          )}
+
+          {/* DEMONSTRATIVO FINANCEIRO: ENTRADAS VS SAÍDAS */}
+          {viewMode === 'FINANCIAL_FLOW' && (
+            <FinancialFlowReport invoices={invoices} user={user} />
           )}
         </div>
       </div>

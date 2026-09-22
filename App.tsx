@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { User, UserRole, Product, Batch, Invoice, InvoiceStatus } from './types';
 import { db } from './services/db';
 import { SyncService } from './services/syncService';
+import { SaleService } from './services/saleService';
 import Layout from './components/Layout';
 import Dashboard from './views/Dashboard';
 import Inventory from './views/Inventory';
@@ -9,6 +10,7 @@ import Billing from './views/Billing';
 import Reports from './views/Reports';
 import Login from './views/Login';
 import Users from './views/Users';
+import { RecoveryBilling } from './views/RecoveryBilling';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -52,7 +54,9 @@ const App: React.FC = () => {
       setUsers(u);
       setProducts(calculatedProducts);
       setBatches(sanitizedBatches);
-      setInvoices(i);
+      // Faturas organizadas em ordem crescente dos dias e dos meses
+      const sortedInvoices = [...i].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime() || (a.invoiceNumber || '').localeCompare(b.invoiceNumber || ''));
+      setInvoices(sortedInvoices);
     } catch (err) {
       console.error('[reloadLocalData Error]', err);
     }
@@ -334,8 +338,10 @@ const App: React.FC = () => {
 
   const handleAddInvoice = async (newInvoice: Invoice) => {
     try {
-      await SyncService.createInvoice(newInvoice);
+      await SaleService.completeSale(newInvoice);
       await reloadLocalData();
+      // Dispara envio em segundo plano
+      SyncService.processQueue().then(() => reloadLocalData()).catch(() => {});
     } catch (err: any) {
       console.error('[handleAddInvoice Error]', err);
       try {
@@ -352,8 +358,10 @@ const App: React.FC = () => {
       return;
     }
     try {
-      await SyncService.cancelInvoice(invoiceId);
+      await SaleService.cancelSale(invoiceId, 'Anulação solicitada pelo Administrador');
       await reloadLocalData();
+      // Dispara envio em segundo plano
+      SyncService.processQueue().then(() => reloadLocalData()).catch(() => {});
     } catch (err: any) {
       console.error('[handleCancelInvoice Error]', err);
       alert(`Erro ao anular fatura: ${err.message || err}`);
@@ -539,6 +547,17 @@ const App: React.FC = () => {
           onAddUser={handleAddUser}
           onUpdateUser={handleUpdateUser}
           onDeleteUser={handleDeleteUser}
+        />
+      )}
+      {activeTab === 'recovery_sales' && (
+        <RecoveryBilling 
+          user={currentUser}
+          products={products}
+          batches={batches}
+          invoices={invoices}
+          onCompleteSale={handleAddInvoice}
+          onLogout={handleLogout}
+          onRefreshData={reloadLocalData}
         />
       )}
     </Layout>

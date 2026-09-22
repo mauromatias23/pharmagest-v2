@@ -65,63 +65,63 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
           </div>
         </div>
         
-        <form onSubmit={handleLogin} className="p-8 space-y-6">
+        <form onSubmit={handleLogin} className="p-8 space-y-6 text-center">
           {error && (
-            <div className="p-3 bg-red-50 text-red-600 text-[11px] font-bold rounded-xl border border-red-100 flex items-center gap-2 animate-in slide-in-from-top-2">
+            <div className="p-3 bg-red-50 text-red-600 text-[11px] font-bold rounded-xl border border-red-100 flex items-center justify-center gap-2 text-center animate-in slide-in-from-top-2">
               <div className="w-5 h-5 bg-red-100 rounded-full flex items-center justify-center text-red-600 shrink-0">!</div>
-              {error}
+              <span className="text-center">{error}</span>
             </div>
           )}
 
-          <div className="space-y-1.5">
-            <label className="block text-xs font-black text-slate-700 uppercase tracking-widest">Utilizador</label>
+          <div className="space-y-1.5 text-center">
+            <label className="block text-xs font-black text-slate-700 uppercase tracking-widest text-center">Utilizador</label>
             <div className="relative">
-              <UserIcon className="absolute left-3 top-3 w-5 h-5 text-slate-400" />
+              <UserIcon className="absolute left-3.5 top-3.5 w-5 h-5 text-slate-400" />
               <select 
                 value={selectedUserId}
                 onChange={(e) => setSelectedUserId(e.target.value)}
-                className="w-full pl-10 pr-10 py-3 border rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-slate-50 outline-none transition-all appearance-none font-medium text-slate-700"
+                className="w-full px-10 py-3 border rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-slate-50 outline-none transition-all appearance-none font-medium text-slate-700 text-center text-center-last"
               >
-                <option value="">Selecione o seu nome...</option>
+                <option value="" className="text-center">Selecione o seu nome...</option>
                 {users.map(u => (
-                  <option key={u.id} value={u.id}>{u.name}</option>
+                  <option key={u.id} value={u.id} className="text-center">{u.name}</option>
                 ))}
               </select>
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <label className="block text-xs font-black text-slate-700 uppercase tracking-widest">Palavra-passe</label>
+          <div className="space-y-1.5 text-center">
+            <label className="block text-xs font-black text-slate-700 uppercase tracking-widest text-center">Palavra-passe</label>
             <div className="relative">
-              <Lock className="absolute left-3 top-3 w-5 h-5 text-slate-400" />
+              <Lock className="absolute left-3.5 top-3.5 w-5 h-5 text-slate-400" />
               <input 
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••"
-                className="w-full pl-10 pr-4 py-3 border rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-slate-50 outline-none transition-all font-mono"
+                className="w-full px-10 py-3 border rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-slate-50 outline-none transition-all font-mono text-center tracking-widest placeholder:text-center"
               />
             </div>
           </div>
 
           <button 
             type="submit"
-            className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black py-4 rounded-xl transition-all shadow-xl shadow-emerald-600/30 uppercase tracking-widest text-xs active:scale-[0.98]"
+            className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black py-4 rounded-xl transition-all shadow-xl shadow-emerald-600/30 uppercase tracking-widest text-xs active:scale-[0.98] text-center flex items-center justify-center"
           >
             Entrar no Sistema
           </button>
 
           <div className="text-center pt-2">
-            <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest flex items-center justify-center gap-1.5">
+            <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest flex items-center justify-center gap-1.5 text-center">
               {isSupabaseConfigured() ? (
                 <>
-                  <CloudCheck className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>Sincronização Automática com Supabase Ativa</span>
+                  <CloudCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  <span className="text-center">Sincronização Automática com Supabase Ativa</span>
                 </>
               ) : (
                 <>
-                  <HardDrive className="w-3.5 h-3.5 text-slate-400" />
-                  <span>Modo Local - IndexedDB Ativo</span>
+                  <HardDrive className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                  <span className="text-center">Modo Local - IndexedDB Ativo</span>
                 </>
               )}
             </p>

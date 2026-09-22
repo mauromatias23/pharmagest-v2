@@ -1,9 +1,18 @@
 import { db, type DailyClosure } from './db';
 import { getSupabase, isSupabaseConfigured, isQuotaExceededError, safeUUID } from './supabaseClient';
-import { type User, type Product, type Batch, type Invoice, type InvoiceItem, InvoiceStatus } from '../types';
+import { 
+  type User, 
+  type Product, 
+  type Batch, 
+  type Invoice, 
+  type InvoiceItem, 
+  InvoiceStatus,
+  SyncOperationStatus,
+  SyncOperationType
+} from '../types';
+import { DeviceService } from './deviceService';
 
 let realtimeChannel: any = null;
-let realtimeDebounceTimer: any = null;
 let autoReconnectInterval: any = null;
 let isAutoSyncing = false;
 
@@ -81,25 +90,121 @@ export const SyncService = {
   },
 
   /**
-   * Subscreve aos eventos em Tempo Real do Supabase com debouncing inteligente
-   * para evitar thundering herds e consumo excessivo de tráfego.
+   * Aplica cirurgicamente uma alteração vinda do Supabase Realtime diretamente
+   * no banco local Dexie, sem NUNCA fazer download completo de todas as tabelas.
+   */
+  async handleSurgicalRealtimeChange(table: string, eventType: string, newRecord: any, oldRecord: any): Promise<void> {
+    try {
+      if (eventType === 'DELETE' && oldRecord?.id) {
+        if (table === 'products') await db.products.delete(oldRecord.id);
+        else if (table === 'batches') await db.batches.delete(oldRecord.id);
+        else if (table === 'users') await db.users.delete(oldRecord.id);
+        return;
+      }
+
+      if (!newRecord) return;
+
+      if (table === 'products') {
+        const p: Product = {
+          id: newRecord.id,
+          code: newRecord.code,
+          name: newRecord.name,
+          activeIngredient: newRecord.active_ingredient,
+          category: newRecord.category,
+          type: newRecord.type || '',
+          priceType: newRecord.price_type,
+          costPrice: Number(newRecord.cost_price) || 0,
+          sellPrice: Number(newRecord.sell_price) || 0,
+          hasVAT: newRecord.has_vat ?? true,
+          supplier: newRecord.supplier || '',
+          minStock: Number(newRecord.min_stock) || 0,
+          totalQuantity: Number(newRecord.total_quantity) || 0,
+          active: newRecord.active ?? true
+        };
+        await db.products.put(p);
+      } else if (table === 'batches') {
+        const b: Batch = {
+          id: newRecord.id,
+          productId: newRecord.product_id,
+          lotNumber: newRecord.lot_number,
+          expiryDate: newRecord.expiry_date,
+          quantity: Math.max(0, Number(newRecord.quantity) || 0),
+          entryDate: newRecord.entry_date
+        };
+        await db.batches.put(b);
+      } else if (table === 'invoices') {
+        // Verificar se a fatura não está em estado PENDING localmente
+        const existingLocal = await db.invoices.get(newRecord.id);
+        if (existingLocal && !existingLocal.synchronized) {
+          // Operação local pendente prevalece
+          return;
+        }
+        const inv: Invoice & { synchronized: boolean } = {
+          id: newRecord.id,
+          invoiceNumber: newRecord.invoice_number,
+          customerId: newRecord.customer_id || undefined,
+          customerName: newRecord.customer_name || 'Consumidor Final',
+          customerNif: newRecord.customer_nif || '999999999',
+          userId: newRecord.user_id || '',
+          userName: newRecord.user_name || 'Operador',
+          date: newRecord.date,
+          totalGross: Number(newRecord.total_gross) || 0,
+          totalVAT: Number(newRecord.total_vat) || 0,
+          totalNet: Number(newRecord.total_net) || 0,
+          status: newRecord.status as InvoiceStatus,
+          paymentMethod: newRecord.payment_method,
+          items: existingLocal?.items || [],
+          closed: newRecord.closed ?? false,
+          closureId: newRecord.closure_id || undefined,
+          shiftNumber: newRecord.shift_number || 1,
+          shiftName: newRecord.shift_name || '1º Turno',
+          synchronized: true
+        };
+        await db.invoices.put(inv);
+      } else if (table === 'daily_closures') {
+        const c: DailyClosure = {
+          id: newRecord.id,
+          date: newRecord.date,
+          userId: newRecord.user_id || '',
+          userName: newRecord.user_name || '',
+          type: newRecord.type || 'SHIFT',
+          shiftNumber: newRecord.shift_number || 1,
+          shiftName: newRecord.shift_name || '1º Turno',
+          totalCash: Number(newRecord.total_cash) || 0,
+          totalTpa: Number(newRecord.total_tpa) || 0,
+          totalTransfer: Number(newRecord.total_transfer) || 0,
+          totalMixed: Number(newRecord.total_mixed) || 0,
+          totalInvoices: Number(newRecord.total_invoices) || 0,
+          grandTotal: Number(newRecord.grand_total) || 0,
+          timestamp: newRecord.timestamp,
+          shiftBreakdowns: newRecord.shift_breakdowns || undefined,
+          synchronized: true
+        };
+        await db.dailyClosures.put(c);
+      }
+    } catch (err) {
+      console.warn(`[handleSurgicalRealtimeChange] Erro ao aplicar alteração em ${table}:`, err);
+    }
+  },
+
+  /**
+   * Subscreve aos eventos em Tempo Real do Supabase de forma cirúrgica.
+   * Aplica diretamente a alteração na tabela local sem recarregar tudo.
    */
   subscribeToRealtime(onDataChanged: () => void) {
     if (!this.isConfigured() || this.isQuotaRestricted()) return;
     const supabase = getSupabase();
     if (!supabase) return;
 
-    const triggerDebouncedSync = () => {
-      if (realtimeDebounceTimer) {
-        clearTimeout(realtimeDebounceTimer);
-      }
-      realtimeDebounceTimer = setTimeout(async () => {
-        if (SyncService.isQuotaRestricted()) return;
-        const res = await SyncService.fetchAllFromSupabase();
-        if (res.success) {
-          onDataChanged();
-        }
-      }, 1500);
+    const handlePayload = async (payload: any) => {
+      await this.handleSurgicalRealtimeChange(
+        payload.table,
+        payload.eventType,
+        payload.new,
+        payload.old
+      );
+      onDataChanged();
+      this.broadcastLocalChange();
     };
 
     try {
@@ -109,18 +214,16 @@ export const SyncService = {
       }
 
       realtimeChannel = supabase
-        .channel('pharma-realtime-all-tables')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, triggerDebouncedSync)
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'batches' }, triggerDebouncedSync)
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'invoices' }, triggerDebouncedSync)
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'invoice_items' }, triggerDebouncedSync)
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, triggerDebouncedSync)
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'daily_closures' }, triggerDebouncedSync)
+        .channel('pharma-realtime-surgical')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, handlePayload)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'batches' }, handlePayload)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'invoices' }, handlePayload)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'daily_closures' }, handlePayload)
         .subscribe((status) => {
-          console.log('[Supabase Realtime Channel Status]:', status);
+          console.log('[Supabase Realtime Cirúrgico Status]:', status);
         });
-    } catch (err) {
-      console.warn('[Realtime Subscription Error]', err);
+    } catch (err: any) {
+      console.warn('[subscribeToRealtime Warning]', err?.message || err);
     }
   },
 
@@ -196,15 +299,15 @@ export const SyncService = {
   },
 
   /**
-   * Resumo de dados pendentes locais (ex: vendas de setembro / qualquer período).
+   * Resumo de dados pendentes locais (calculado a partir da syncQueue e faturas não sincronizadas).
    */
-  async getPendingSyncSummary(): Promise<{ totalInvoices: number; unsyncedInvoices: number; periodInvoices: number }> {
+  async getPendingSyncSummary(): Promise<{ totalInvoices: number; unsyncedInvoices: number; periodInvoices: number; queuePending: number }> {
     try {
       const allInvoices = await db.invoices.toArray();
       const unsynced = allInvoices.filter(i => !i.synchronized);
+      const queuePendingCount = await db.syncQueue.where('status').equals(SyncOperationStatus.PENDING).count();
       const periodInvoices = allInvoices.filter(i => {
         if (!i.date) return false;
-        // Suporte a datas ISO "2026-09-15T...", datas locais "2026-09-15" ou timestamp
         try {
           const dt = new Date(i.date);
           if (isNaN(dt.getTime())) {
@@ -212,7 +315,7 @@ export const SyncService = {
             return str.includes('2026-09-') || str.includes('/09/2026') || str.includes('09-2026');
           }
           const y = dt.getFullYear();
-          const m = dt.getMonth() + 1; // 9 = Setembro
+          const m = dt.getMonth() + 1;
           const d = dt.getDate();
           return y === 2026 && m === 9 && d >= 11 && d <= 21;
         } catch {
@@ -223,35 +326,238 @@ export const SyncService = {
       return {
         totalInvoices: allInvoices.length,
         unsyncedInvoices: unsynced.length,
-        periodInvoices: periodInvoices.length
+        periodInvoices: periodInvoices.length,
+        queuePending: queuePendingCount
       };
     } catch {
-      return { totalInvoices: 0, unsyncedInvoices: 0, periodInvoices: 0 };
+      return { totalInvoices: 0, unsyncedInvoices: 0, periodInvoices: 0, queuePending: 0 };
     }
   },
 
   /**
-   * Exporta todas as faturas locais para um ficheiro JSON para transferir de um computador/link para outro.
+   * Processa a fila de operações local (syncQueue) de forma atómica e idempotente.
+   * Transita de PENDING -> SYNCING -> SYNCED com confirmação individual.
    */
-  async exportLocalDataToJSON(): Promise<{ invoices: any[]; closures: any[] }> {
-    const invoices = await db.invoices.toArray();
-    const closures = await db.dailyClosures.toArray();
-    return { invoices, closures };
+  async processQueue(): Promise<{ processed: number; succeeded: number; failed: number }> {
+    if (!this.isConfigured() || this.isQuotaRestricted()) {
+      return { processed: 0, succeeded: 0, failed: 0 };
+    }
+    const supabase = getSupabase();
+    if (!supabase) return { processed: 0, succeeded: 0, failed: 0 };
+
+    const pendingOps = await db.syncQueue
+      .where('status')
+      .equals(SyncOperationStatus.PENDING)
+      .sortBy('id');
+
+    if (pendingOps.length === 0) {
+      return { processed: 0, succeeded: 0, failed: 0 };
+    }
+
+    let succeeded = 0;
+    let failed = 0;
+
+    for (const op of pendingOps) {
+      if (!op.id) continue;
+      try {
+        await db.syncQueue.update(op.id, { status: SyncOperationStatus.SYNCING });
+
+        let opSuccess = false;
+
+        if (op.entityType === 'INVOICE') {
+          if (op.operationType === SyncOperationType.CREATE) {
+            const inv = op.payload as Invoice;
+            // 1. Enviar fatura
+            const { error: invErr } = await supabase.from('invoices').upsert({
+              id: inv.id,
+              invoice_number: inv.invoiceNumber,
+              customer_id: inv.customerId || null,
+              customer_name: inv.customerName || null,
+              customer_nif: inv.customerNif || null,
+              user_id: inv.userId || null,
+              user_name: inv.userName,
+              date: inv.date,
+              total_gross: Number(inv.totalGross) || 0,
+              total_vat: Number(inv.totalVAT) || 0,
+              total_net: Number(inv.totalNet) || 0,
+              status: inv.status,
+              payment_method: inv.paymentMethod,
+              closed: Boolean(inv.closed),
+              closure_id: inv.closureId || null,
+              shift_number: inv.shiftNumber || 1,
+              shift_name: inv.shiftName || '1º Turno'
+            }, { onConflict: 'id' });
+
+            if (!invErr || invErr.message?.includes('duplicate key')) {
+              // 2. Enviar itens
+              if (inv.items && inv.items.length > 0) {
+                const itemsToUpsert = inv.items.map(it => ({
+                  id: it.id,
+                  invoice_id: inv.id,
+                  product_id: it.productId || null,
+                  product_name: it.productName || 'Item',
+                  batch_id: it.batchId || null,
+                  lot_number: it.lotNumber || 'LOTE-PADRAO',
+                  quantity: Number(it.quantity) || 1,
+                  unit_price: Number(it.unitPrice) || 0,
+                  subtotal: Number(it.subtotal) || 0,
+                  vat_amount: Number(it.vatAmount) || 0
+                }));
+                await supabase.from('invoice_items').upsert(itemsToUpsert, { onConflict: 'id' });
+              }
+              opSuccess = true;
+              await db.invoices.update(inv.id, { synchronized: true });
+            }
+          } else if (op.operationType === SyncOperationType.CANCEL) {
+            const { error: cancelErr } = await supabase.from('invoices').update({
+              status: InvoiceStatus.CANCELLED
+            }).eq('id', op.entityId);
+            if (!cancelErr) {
+              opSuccess = true;
+              await db.invoices.update(op.entityId, { synchronized: true });
+            }
+          }
+        } else if (op.entityType === 'DAILY_CLOSURE') {
+          const c = op.payload as DailyClosure;
+          const { error: closErr } = await supabase.from('daily_closures').upsert({
+            id: c.id,
+            date: c.date,
+            user_id: c.userId || null,
+            user_name: c.userName,
+            type: c.type || 'SHIFT',
+            shift_number: c.shiftNumber || 1,
+            shift_name: c.shiftName || '1º Turno',
+            total_cash: c.totalCash,
+            total_tpa: c.totalTpa,
+            total_transfer: c.totalTransfer,
+            total_mixed: c.totalMixed,
+            total_invoices: c.totalInvoices,
+            grand_total: c.grandTotal,
+            timestamp: c.timestamp,
+            shift_breakdowns: c.shiftBreakdowns || null
+          }, { onConflict: 'id' });
+          if (!closErr) {
+            opSuccess = true;
+            await db.dailyClosures.update(c.id, { synchronized: true });
+          }
+        } else {
+          // Operações de outras entidades (genérica)
+          opSuccess = true;
+        }
+
+        if (opSuccess) {
+          await db.syncQueue.update(op.id, {
+            status: SyncOperationStatus.SYNCED,
+            syncedAt: new Date().toISOString()
+          });
+          succeeded++;
+        } else {
+          await db.syncQueue.update(op.id, {
+            status: SyncOperationStatus.PENDING,
+            attempts: (op.attempts || 0) + 1
+          });
+          failed++;
+        }
+      } catch (err: any) {
+        if (isQuotaExceededError(err)) {
+          this.setQuotaRestricted(true, err.message);
+          await db.syncQueue.update(op.id, {
+            status: SyncOperationStatus.PENDING,
+            lastError: err?.message
+          });
+          break; // Para o loop pois o servidor está inacessível
+        } else {
+          await db.syncQueue.update(op.id, {
+            status: SyncOperationStatus.PENDING,
+            attempts: (op.attempts || 0) + 1,
+            lastError: err?.message
+          });
+          failed++;
+        }
+      }
+    }
+
+    return { processed: pendingOps.length, succeeded, failed };
   },
 
   /**
-   * Importa faturas e fechos de um ficheiro JSON para a base de dados local deste navegador.
+   * Exporta todo o banco local completo para backup JSON (preservação absoluta de dados).
    */
-  async importLocalDataFromJSON(data: { invoices?: any[]; closures?: any[] }): Promise<{ importedInvoices: number; importedClosures: number }> {
+  async exportLocalDataToJSON(): Promise<{ 
+    metadata: { exportedAt: string; deviceId: string; version: number };
+    users: any[];
+    products: any[];
+    batches: any[];
+    invoices: any[]; 
+    closures: any[]; 
+    stockMovements: any[];
+    purchases: any[];
+    expenses: any[];
+    syncQueue: any[];
+  }> {
+    const users = await db.users.toArray();
+    const products = await db.products.toArray();
+    const batches = await db.batches.toArray();
+    const invoices = await db.invoices.toArray();
+    const closures = await db.dailyClosures.toArray();
+    const stockMovements = await db.stockMovements.toArray();
+    const purchases = await db.purchases.toArray();
+    const expenses = await db.expenses.toArray();
+    const syncQueue = await db.syncQueue.toArray();
+
+    return {
+      metadata: {
+        exportedAt: new Date().toISOString(),
+        deviceId: DeviceService.getDeviceId(),
+        version: 95
+      },
+      users,
+      products,
+      batches,
+      invoices,
+      closures,
+      stockMovements,
+      purchases,
+      expenses,
+      syncQueue
+    };
+  },
+
+  /**
+   * Importa dados de um ficheiro JSON para a base de dados local deste navegador
+   * de forma estritamente aditiva (sem sobrescrever faturas existentes).
+   */
+  async importLocalDataFromJSON(data: { 
+    invoices?: any[]; 
+    closures?: any[]; 
+    products?: any[]; 
+    batches?: any[]; 
+    stockMovements?: any[];
+    expenses?: any[];
+  }): Promise<{ importedInvoices: number; importedClosures: number }> {
     let importedInvoices = 0;
     let importedClosures = 0;
 
     if (data.invoices && Array.isArray(data.invoices) && data.invoices.length > 0) {
       for (const inv of data.invoices) {
         try {
-          // Marca como pendente de sincronização para garantir que é enviado para o Supabase
-          await db.invoices.put({ ...inv, synchronized: false });
-          importedInvoices++;
+          const existing = await db.invoices.get(inv.id);
+          if (!existing) {
+            await db.invoices.put({ ...inv, synchronized: false });
+            // Cria operação pendente na syncQueue
+            await db.syncQueue.add({
+              operationId: inv.operationId || DeviceService.generateOperationId(),
+              deviceId: inv.deviceId || DeviceService.getDeviceId(),
+              entityType: 'INVOICE',
+              entityId: inv.id,
+              operationType: SyncOperationType.CREATE,
+              payload: inv,
+              createdAt: inv.date || new Date().toISOString(),
+              status: SyncOperationStatus.PENDING,
+              attempts: 0
+            });
+            importedInvoices++;
+          }
         } catch (e) {
           console.warn('[importLocalDataFromJSON] Erro ao importar fatura:', e);
         }
@@ -261,12 +567,31 @@ export const SyncService = {
     if (data.closures && Array.isArray(data.closures) && data.closures.length > 0) {
       for (const c of data.closures) {
         try {
-          await db.dailyClosures.put({ ...c, synchronized: false });
-          importedClosures++;
+          const existing = await db.dailyClosures.get(c.id);
+          if (!existing) {
+            await db.dailyClosures.put({ ...c, synchronized: false });
+            importedClosures++;
+          }
         } catch (e) {
           console.warn('[importLocalDataFromJSON] Erro ao importar fecho:', e);
         }
       }
+    }
+
+    if (data.products && Array.isArray(data.products) && data.products.length > 0) {
+      await db.products.bulkPut(data.products);
+    }
+
+    if (data.batches && Array.isArray(data.batches) && data.batches.length > 0) {
+      await db.batches.bulkPut(data.batches);
+    }
+
+    if (data.stockMovements && Array.isArray(data.stockMovements) && data.stockMovements.length > 0) {
+      await db.stockMovements.bulkPut(data.stockMovements);
+    }
+
+    if (data.expenses && Array.isArray(data.expenses) && data.expenses.length > 0) {
+      await db.expenses.bulkPut(data.expenses);
     }
 
     this.broadcastLocalChange();
@@ -751,22 +1076,13 @@ export const SyncService = {
       const localOnlyClosures = currentLocalClosures.filter(loc => !remoteClosureIds.has(loc.id));
       const combinedClosures = [...mappedClosures, ...localOnlyClosures];
 
-      // 7. Atualizar o Dexie local de forma segura e atómica
+      // 7. Atualizar o Dexie local de forma estritamente aditiva e não-destrutiva (sem clear())
       await db.transaction('rw', [db.users, db.products, db.batches, db.invoices, db.dailyClosures], async () => {
-        await db.users.clear();
-        if (mappedUsers.length > 0) await db.users.bulkAdd(mappedUsers);
-
-        await db.products.clear();
-        if (mappedProducts.length > 0) await db.products.bulkAdd(mappedProducts);
-
-        await db.batches.clear();
-        if (mappedBatches.length > 0) await db.batches.bulkAdd(mappedBatches);
-
-        await db.invoices.clear();
-        if (combinedInvoices.length > 0) await db.invoices.bulkAdd(combinedInvoices);
-
-        await db.dailyClosures.clear();
-        if (combinedClosures.length > 0) await db.dailyClosures.bulkAdd(combinedClosures);
+        if (mappedUsers.length > 0) await db.users.bulkPut(mappedUsers);
+        if (mappedProducts.length > 0) await db.products.bulkPut(mappedProducts);
+        if (mappedBatches.length > 0) await db.batches.bulkPut(mappedBatches);
+        if (mappedInvoices.length > 0) await db.invoices.bulkPut(mappedInvoices);
+        if (mappedClosures.length > 0) await db.dailyClosures.bulkPut(mappedClosures);
       });
 
       const totalPulled = mappedUsers.length + mappedProducts.length + mappedBatches.length + mappedInvoices.length + mappedClosures.length;
@@ -797,9 +1113,17 @@ export const SyncService = {
 
   /**
    * Sincronização geral manual completa (Bidirecional: Envia faturas/fechos locais e traz novidades da nuvem)
+   * Ordem estrita: LOCAL PENDING -> SUPABASE -> CONFIRMAÇÃO -> SUPABASE -> LOCAL (Regra 14)
    */
   async syncAll(): Promise<{ success: boolean; pushed: number; pulled: number; message: string }> {
-    // 1. PRIMEIRO: Enviar todos os dados locais pendentes (11/09 a 21/09, fechos, etc.) para o Supabase
+    // 1. Processar a fila de operações pendentes (syncQueue) com confirmação individual
+    try {
+      await this.processQueue();
+    } catch (qErr) {
+      console.warn('[syncAll processQueue warning]', qErr);
+    }
+
+    // 2. Enviar dados pendentes diretos (faturas locais não sincronizadas)
     let pushRes = { success: false, pushed: 0, message: '' };
     try {
       pushRes = await this.pushAllLocalToSupabase();
@@ -807,7 +1131,7 @@ export const SyncService = {
       console.warn('[syncAll Push Warning]', pushErr);
     }
 
-    // 2. SEGUNDO: Buscar os dados atualizados do Supabase preservando dados locais
+    // 3. Buscar os dados atualizados do Supabase preservando dados locais (sem clear())
     const pullRes = await this.fetchAllFromSupabase();
 
     const isSuccess = pushRes.success || pullRes.success;
@@ -1902,9 +2226,26 @@ export const SyncService = {
       const totalMixed = dayInvoices.filter(i => i.paymentMethod === 'Misto').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
       const grandTotal = totalCash + totalTpa + totalTransfer + totalMixed;
 
+      // Chave determinística para evitar duplicatas em múltiplos computadores (Regra 34)
+      const deterministicClosureId = `CLOSURE_${pastDate}_GENERAL_1`;
+      const existingClosure = await db.dailyClosures.get(deterministicClosureId);
+      if (existingClosure) {
+        // Já foi fechado por outro terminal ou em execução prévia
+        for (const inv of dayInvoices) {
+          await db.invoices.update(inv.id, {
+            closed: true,
+            closureId: deterministicClosureId
+          });
+        }
+        continue;
+      }
+
       const autoClosure: DailyClosure = {
-        id: safeUUID(),
+        id: deterministicClosureId,
+        operationId: `OP_${deterministicClosureId}`,
+        deviceId: DeviceService.getDeviceId(),
         date: pastDate,
+        userId: 'system_auto_midnight',
         userName: 'Sistema (Fecho Automático 00:00)',
         type: 'GENERAL',
         shiftNumber: 1,
