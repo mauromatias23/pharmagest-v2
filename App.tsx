@@ -11,6 +11,7 @@ import Reports from './views/Reports';
 import Login from './views/Login';
 import Users from './views/Users';
 import { RecoveryBilling } from './views/RecoveryBilling';
+import { INITIAL_USERS } from './services/mockData';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -26,20 +27,27 @@ const App: React.FC = () => {
   // Carrega os dados mais recentes de Dexie para o React State
   const reloadLocalData = async () => {
     try {
-      const [u, p, b, i] = await Promise.all([
+      const [u, p, b, i, deleted] = await Promise.all([
         db.users.toArray(),
         db.products.toArray(),
         db.batches.toArray(),
-        db.invoices.orderBy('date').reverse().toArray()
+        db.invoices.orderBy('date').reverse().toArray(),
+        db.deletedRecords.toArray()
       ]);
 
-      const sanitizedBatches = b.map(batch => ({
+      const deletedProductIds = new Set(deleted.filter(d => d.table === 'products').map(d => d.id));
+      const deletedBatchIds = new Set(deleted.filter(d => d.table === 'batches').map(d => d.id));
+
+      const activeProducts = p.filter(prod => !deletedProductIds.has(prod.id) && prod.active !== false);
+      const activeBatches = b.filter(batch => !deletedBatchIds.has(batch.id) && !deletedProductIds.has(batch.productId));
+
+      const sanitizedBatches = activeBatches.map(batch => ({
         ...batch,
         quantity: Math.max(0, Number(batch.quantity) || 0)
       }));
 
       // Calcula com precisão matemática absoluta o Stock Atual de cada produto a partir dos seus lotes reais
-      const calculatedProducts = p.map(prod => {
+      const calculatedProducts = activeProducts.map(prod => {
         const prodBatches = sanitizedBatches.filter(batch => batch.productId === prod.id);
         const calculatedStock = prodBatches.length > 0
           ? Math.max(0, prodBatches.reduce((acc, batch) => acc + Math.max(0, Number(batch.quantity) || 0), 0))
@@ -51,7 +59,13 @@ const App: React.FC = () => {
         };
       });
 
-      setUsers(u);
+      let finalUsers = u;
+      if (!finalUsers || finalUsers.length === 0) {
+        await db.users.bulkPut(INITIAL_USERS);
+        finalUsers = INITIAL_USERS;
+      }
+
+      setUsers(finalUsers);
       setProducts(calculatedProducts);
       setBatches(sanitizedBatches);
       // Faturas organizadas em ordem crescente dos dias e dos meses
@@ -271,8 +285,8 @@ const App: React.FC = () => {
       setProducts(prev => prev.filter(p => p.id !== productId));
       setBatches(prev => prev.filter(b => b.productId !== productId));
 
-      // 2. Eliminar no Supabase e no Dexie
-      await SyncService.deleteProduct(productId);
+      // 2. Eliminar no Supabase e no Dexie com Tombstone e Queue
+      await SyncService.deleteProduct(productId, currentUser?.id);
       await reloadLocalData();
     } catch (err: any) {
       console.error('[handleDeleteProduct Error]', err);
@@ -323,7 +337,7 @@ const App: React.FC = () => {
       setBatches(prev => prev.filter(b => b.id !== batchId));
 
       // 2. Eliminar no Supabase e no Dexie
-      await SyncService.deleteBatch(batchId);
+      await SyncService.deleteBatch(batchId, currentUser?.id);
       await reloadLocalData();
     } catch (err: any) {
       console.error('[handleDeleteBatch Error]', err);
@@ -339,9 +353,13 @@ const App: React.FC = () => {
   const handleAddInvoice = async (newInvoice: Invoice) => {
     try {
       await SaleService.completeSale(newInvoice);
-      await reloadLocalData();
-      // Dispara envio em segundo plano
-      SyncService.processQueue().then(() => reloadLocalData()).catch(() => {});
+      // Atualização imediata do estado de faturas sem bloquear a tela com reload geral síncrono
+      setInvoices(prev => [newInvoice, ...prev.filter(i => i.id !== newInvoice.id)]);
+      // Dispara recarregamento e envio assíncrono em segundo plano
+      setTimeout(() => {
+        reloadLocalData().catch(() => {});
+        SyncService.processQueue().then(() => reloadLocalData()).catch(() => {});
+      }, 50);
     } catch (err: any) {
       console.error('[handleAddInvoice Error]', err);
       try {

@@ -148,6 +148,30 @@ export class PharmaDatabase extends Dexie {
       const userCount = await this.users.count();
       if (userCount === 0) {
         await this.users.bulkAdd(INITIAL_USERS);
+      } else {
+        // Assegurar que nenhum utilizador fica sem senha válida ou com valor nulo
+        const allUsers = await this.users.toArray();
+        for (const u of allUsers) {
+          const pass = (u.password && String(u.password).trim() !== '') ? String(u.password).trim() : null;
+          if (!pass) {
+            const norm = (u.name || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+            let defaultPass = 'admin123';
+            if (u.role === UserRole.ADMIN || norm.includes('admin') || u.id === 'u-admin') {
+              defaultPass = '1111';
+            } else if (norm.includes('1') || u.id === 'u-f1') {
+              defaultPass = '2222';
+            } else if (norm.includes('2') || u.id === 'u-f2') {
+              defaultPass = '3333';
+            }
+            await this.users.update(u.id, { password: defaultPass, active: true });
+          }
+        }
+
+        // Garante que existe pelo menos uma conta de Administrador
+        const hasAdmin = (await this.users.toArray()).some(u => u.role === UserRole.ADMIN);
+        if (!hasAdmin) {
+          await this.users.put({ id: 'u-admin', name: 'Administrador', role: UserRole.ADMIN, active: true, password: '1111' });
+        }
       }
     } catch (err) {
       console.warn('[db.populate Warning]', err);
