@@ -35,6 +35,14 @@ export const SyncService = {
     return isSupabaseConfigured();
   },
 
+  getOrCreateDeviceId(): string {
+    return DeviceService.getDeviceId();
+  },
+
+  getDeviceId(): string {
+    return DeviceService.getDeviceId();
+  },
+
   isQuotaRestricted(): boolean {
     return _isQuotaRestricted;
   },
@@ -244,6 +252,31 @@ export const SyncService = {
           synchronized: true
         };
         await db.dailyClosures.put(c);
+      } else if (table === 'users') {
+        const userId = newRecord.id;
+        const local = await db.users.get(userId);
+
+        // Se houver alteração de utilizador pendente na fila local, a versão local mais recente prevalece
+        const pendingUserOp = await db.syncQueue
+          .where('entityId')
+          .equals(userId)
+          .filter(op => op.status === SyncOperationStatus.PENDING)
+          .first();
+        if (pendingUserOp) {
+          return;
+        }
+
+        const u: User = {
+          id: newRecord.id,
+          name: newRecord.name,
+          role: newRecord.role as UserRole,
+          active: newRecord.active ?? true,
+          password: (newRecord.password && String(newRecord.password).trim() !== '') 
+            ? String(newRecord.password).trim() 
+            : (local?.password || undefined),
+          passwordUpdatedAt: local?.passwordUpdatedAt
+        };
+        await db.users.put(u);
       }
     } catch (err) {
       console.warn(`[handleSurgicalRealtimeChange] Erro ao aplicar alteração em ${table}:`, err);
@@ -278,6 +311,7 @@ export const SyncService = {
 
       realtimeChannel = supabase
         .channel('pharma-realtime-surgical')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, handlePayload)
         .on('postgres_changes', { event: '*', schema: 'public', table: 'products' }, handlePayload)
         .on('postgres_changes', { event: '*', schema: 'public', table: 'batches' }, handlePayload)
         .on('postgres_changes', { event: '*', schema: 'public', table: 'invoices' }, handlePayload)
@@ -589,6 +623,23 @@ export const SyncService = {
                 }, { onConflict: 'id' });
                 if (!bErr) opSuccess = true;
               }
+            }
+          }
+        } else if (op.entityType === 'USER') {
+          if (op.operationType === SyncOperationType.DELETE) {
+            const { error: uDelErr } = await supabase.from('users').delete().eq('id', op.entityId);
+            if (!uDelErr) opSuccess = true;
+          } else if (op.operationType === SyncOperationType.CREATE || op.operationType === SyncOperationType.UPDATE) {
+            const u = op.payload;
+            if (u) {
+              const { error: uErr } = await supabase.from('users').upsert({
+                id: u.id,
+                name: u.name,
+                role: u.role,
+                active: u.active ?? true,
+                password: u.password || null
+              }, { onConflict: 'id' });
+              if (!uErr) opSuccess = true;
             }
           }
         } else {
@@ -1193,33 +1244,59 @@ export const SyncService = {
       const currentLocalUsers = await db.users.toArray();
       const localUserMap = new Map(currentLocalUsers.map(u => [u.id, u]));
 
+      // Identificar utilizadores com operações pendentes na fila
+      const pendingUserOps = await db.syncQueue
+        .where('entityType')
+        .equals('USER')
+        .filter(op => op.status === SyncOperationStatus.PENDING)
+        .toArray();
+      const pendingUserIds = new Set(pendingUserOps.map(op => op.entityId));
+
       const mappedUsers: User[] = (remoteUsers || []).map(u => {
         const local = localUserMap.get(u.id);
-        let finalPassword = (u.password && String(u.password).trim() !== '') 
-          ? String(u.password).trim() 
-          : (local?.password ? String(local.password).trim() : undefined);
+        const hasPendingLocalOp = pendingUserIds.has(u.id);
+
+        if (hasPendingLocalOp && local) {
+          return local;
+        }
+
+        let finalPassword = local?.password;
+        // Se a senha local foi alterada pelo utilizador nesta máquina (tem passwordUpdatedAt):
+        if (local?.passwordUpdatedAt && local.password) {
+          finalPassword = local.password;
+        } else if (u.password && String(u.password).trim() !== '') {
+          finalPassword = String(u.password).trim();
+        } else {
+          finalPassword = local?.password;
+        }
 
         if (!finalPassword) {
-          const norm = (u.name || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
-          if (u.role === UserRole.ADMIN || norm.includes('admin') || u.id === 'u-admin') {
+          if (u.role === UserRole.ADMIN || u.id === 'u-admin') {
             finalPassword = '1111';
-          } else if (norm.includes('1') || u.id === 'u-f1') {
+          } else if (u.id === 'u-f1') {
             finalPassword = '2222';
-          } else if (norm.includes('2') || u.id === 'u-f2') {
+          } else if (u.id === 'u-f2') {
             finalPassword = '3333';
-          } else {
-            finalPassword = 'admin123';
           }
         }
 
         return {
           id: u.id,
-          name: u.name,
-          role: u.role as UserRole,
-          active: u.active ?? true,
-          password: finalPassword
+          name: (hasPendingLocalOp || local?.passwordUpdatedAt) && local ? local.name : u.name,
+          role: ((hasPendingLocalOp || local?.passwordUpdatedAt) && local ? local.role : u.role) as UserRole,
+          active: (hasPendingLocalOp || local?.passwordUpdatedAt) && local ? local.active : (u.active ?? true),
+          password: finalPassword,
+          passwordUpdatedAt: local?.passwordUpdatedAt
         };
       });
+
+      // Preservar utilizadores criados localmente que ainda não constam na nuvem
+      const remoteUserIds = new Set((remoteUsers || []).map(u => u.id));
+      for (const locUser of currentLocalUsers) {
+        if (!remoteUserIds.has(locUser.id)) {
+          mappedUsers.push(locUser);
+        }
+      }
 
       // Filtrar lotes remotos válidos (não deletados e pertencentes a produtos válidos ativos)
       const validRemoteBatches = (remoteBatches || []).filter(b => 
@@ -1847,7 +1924,7 @@ export const SyncService = {
 
     // 5. REGISTRO NA FILA DE OPERAÇÕES (syncQueue):
     // Garante que a deleção seja enviada ao Supabase offline-first e permaneça PENDING até confirmação
-    const deviceId = this.getOrCreateDeviceId();
+    const deviceId = DeviceService.getDeviceId();
     const opId = safeUUID();
     const deleteOp: SyncOperation = {
       id: opId,
@@ -2014,7 +2091,7 @@ export const SyncService = {
     }
 
     // 3. Fila de sincronização (PENDING até confirmação)
-    const deviceId = this.getOrCreateDeviceId();
+    const deviceId = DeviceService.getDeviceId();
     const opId = safeUUID();
     const deleteOp: SyncOperation = {
       id: opId,
@@ -2610,19 +2687,55 @@ export const SyncService = {
   // =========================================================================
 
   async createUser(user: User): Promise<void> {
-    const supabase = getSupabase();
+    const newUser: User = {
+      ...user,
+      passwordUpdatedAt: user.passwordUpdatedAt || Date.now()
+    };
 
+    // 1. Salvar no Dexie local imediatamente
+    await db.users.put(newUser);
+    this.broadcastLocalChange();
+
+    // 2. Registar na fila de sincronização segura
+    const syncOp: SyncOperation = {
+      operationId: safeUUID(),
+      deviceId: DeviceService.getDeviceId(),
+      entityType: 'USER',
+      entityId: newUser.id,
+      operationType: SyncOperationType.CREATE,
+      payload: {
+        id: newUser.id,
+        name: newUser.name,
+        role: newUser.role,
+        active: newUser.active ?? true,
+        password: newUser.password || null
+      },
+      createdAt: new Date().toISOString(),
+      status: SyncOperationStatus.PENDING,
+      attempts: 0
+    };
+    const opQueueId = await db.syncQueue.put(syncOp);
+
+    // 3. Tentar enviar imediatamente para o Supabase
+    const supabase = getSupabase();
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
         const { error } = await supabase.from('users').upsert({
-          id: user.id,
-          name: user.name,
-          role: user.role,
-          active: user.active ?? true,
-          password: user.password || null
+          id: newUser.id,
+          name: newUser.name,
+          role: newUser.role,
+          active: newUser.active ?? true,
+          password: newUser.password || null
         }, { onConflict: 'id' });
 
-        if (error) {
+        if (!error) {
+          if (opQueueId) {
+            await db.syncQueue.update(opQueueId, {
+              status: SyncOperationStatus.SYNCED,
+              syncedAt: new Date().toISOString()
+            });
+          }
+        } else {
           console.warn('[createUser Supabase Warning]', error);
           if (isQuotaExceededError(error)) {
             this.setQuotaRestricted(true, error.message);
@@ -2635,26 +2748,58 @@ export const SyncService = {
         }
       }
     }
-
-    // Salvar simultaneamente no Dexie local
-    await db.users.put(user);
-    this.broadcastLocalChange();
   },
 
   async updateUser(user: User): Promise<void> {
-    const supabase = getSupabase();
+    const updatedUser: User = {
+      ...user,
+      passwordUpdatedAt: user.passwordUpdatedAt || Date.now()
+    };
 
+    // 1. Salvar no Dexie local imediatamente
+    await db.users.put(updatedUser);
+    this.broadcastLocalChange();
+
+    // 2. Registar na fila de sincronização segura
+    const syncOp: SyncOperation = {
+      operationId: safeUUID(),
+      deviceId: DeviceService.getDeviceId(),
+      entityType: 'USER',
+      entityId: updatedUser.id,
+      operationType: SyncOperationType.UPDATE,
+      payload: {
+        id: updatedUser.id,
+        name: updatedUser.name,
+        role: updatedUser.role,
+        active: updatedUser.active ?? true,
+        password: updatedUser.password || null
+      },
+      createdAt: new Date().toISOString(),
+      status: SyncOperationStatus.PENDING,
+      attempts: 0
+    };
+    const opQueueId = await db.syncQueue.put(syncOp);
+
+    // 3. Tentar enviar imediatamente para o Supabase
+    const supabase = getSupabase();
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
         const { error } = await supabase.from('users').upsert({
-          id: user.id,
-          name: user.name,
-          role: user.role,
-          active: user.active,
-          password: user.password || null
+          id: updatedUser.id,
+          name: updatedUser.name,
+          role: updatedUser.role,
+          active: updatedUser.active,
+          password: updatedUser.password || null
         }, { onConflict: 'id' });
 
-        if (error) {
+        if (!error) {
+          if (opQueueId) {
+            await db.syncQueue.update(opQueueId, {
+              status: SyncOperationStatus.SYNCED,
+              syncedAt: new Date().toISOString()
+            });
+          }
+        } else {
           console.warn('[updateUser Supabase Warning]', error);
           if (isQuotaExceededError(error)) {
             this.setQuotaRestricted(true, error.message);
@@ -2667,26 +2812,46 @@ export const SyncService = {
         }
       }
     }
-
-    // Salvar simultaneamente no Dexie local
-    await db.users.put(user);
-    this.broadcastLocalChange();
   },
 
   async deleteUser(userId: string): Promise<void> {
-    const supabase = getSupabase();
+    // 1. Expurga da Cache Local
+    await db.users.delete(userId);
+    this.broadcastLocalChange();
 
+    // 2. Registar operação de exclusão na fila de sincronização
+    const syncOp: SyncOperation = {
+      operationId: safeUUID(),
+      deviceId: DeviceService.getDeviceId(),
+      entityType: 'USER',
+      entityId: userId,
+      operationType: SyncOperationType.DELETE,
+      payload: { id: userId },
+      createdAt: new Date().toISOString(),
+      status: SyncOperationStatus.PENDING,
+      attempts: 0
+    };
+    const opQueueId = await db.syncQueue.put(syncOp);
+
+    // 3. Tentar eliminar no Supabase
+    const supabase = getSupabase();
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
-        // 1. Desvincular faturas e fechos de caixa deste utilizador para não bloquear FK
+        // Desvincular faturas e fechos de caixa deste utilizador para não bloquear FK
         try {
           await supabase.from('invoices').update({ user_id: null }).eq('user_id', userId);
           await supabase.from('daily_closures').update({ user_id: null }).eq('user_id', userId);
         } catch (uFkErr) {}
 
-        // 2. Eliminar o utilizador no Supabase
         const { error } = await supabase.from('users').delete().eq('id', userId);
-        if (error) {
+        if (!error) {
+          if (opQueueId) {
+            await db.syncQueue.update(opQueueId, {
+              status: SyncOperationStatus.SYNCED,
+              syncedAt: new Date().toISOString()
+            });
+          }
+        } else {
           console.warn('[deleteUser Supabase Warning]', error);
           if (isQuotaExceededError(error)) {
             this.setQuotaRestricted(true, error.message);
@@ -2699,10 +2864,6 @@ export const SyncService = {
         }
       }
     }
-
-    // Expurga da Cache Local
-    await db.users.delete(userId);
-    this.broadcastLocalChange();
   },
 
   // =========================================================================

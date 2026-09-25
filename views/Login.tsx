@@ -19,52 +19,31 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
 
-  // Validação ultra-robusta de credenciais com fallback seguro
+  // Validação segura de credenciais: a senha cadastrada do utilizador é estritamente exigida
   const checkPassword = (user: User, inputPass: string): boolean => {
     const cleanInput = (inputPass || '').trim();
     if (!cleanInput) return false;
 
-    // 1. Verificar senha armazenada do utilizador (se existir, convertida em string e limpa)
+    // 1. Verificar senha armazenada do utilizador
     const storedPass = (user.password !== undefined && user.password !== null) 
       ? String(user.password).trim() 
       : '';
     
-    if (storedPass !== '' && cleanInput === storedPass) {
-      return true;
+    // Se o utilizador possui senha cadastrada, APENAS essa senha é válida
+    if (storedPass !== '') {
+      return cleanInput === storedPass;
     }
 
-    // 2. Senha mestra global de recuperação/emergência para todos os utilizadores
-    if (cleanInput === 'admin123') {
-      return true;
+    // 2. Se e somente se o utilizador NUNCA tiver tido uma senha definida (primeiro acesso de fábrica):
+    // Aceita a senha inicial padrão estritamente de acordo com o identificador
+    if (user.role === UserRole.ADMIN || user.id === 'u-admin') {
+      return cleanInput === '1111';
     }
-
-    // 3. Normalização do nome para tolerar acentos e maiúsculas/minúsculas
-    const normName = (user.name || '')
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .trim();
-
-    // 4. Administrador: aceita SEMPRE '1111'
-    if (user.role === UserRole.ADMIN || normName.includes('admin') || user.id === 'u-admin') {
-      if (cleanInput === '1111') return true;
+    if (user.id === 'u-f1') {
+      return cleanInput === '2222';
     }
-
-    // 5. Funcionario 1: aceita SEMPRE '2222'
-    if (normName.includes('funcionario 1') || normName.includes('caixa 1') || user.id === 'u-f1') {
-      if (cleanInput === '2222') return true;
-    }
-
-    // 6. Funcionario 2: aceita SEMPRE '3333'
-    if (normName.includes('funcionario 2') || normName.includes('caixa 2') || user.id === 'u-f2') {
-      if (cleanInput === '3333') return true;
-    }
-
-    // 7. Se não houver senha armazenada, aceita senhas padrão por perfil
-    if (!storedPass) {
-      if (user.role === UserRole.CASHIER) {
-        if (cleanInput === '2222' || cleanInput === '3333') return true;
-      }
+    if (user.id === 'u-f2') {
+      return cleanInput === '3333';
     }
 
     return false;
@@ -100,7 +79,7 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
       }
       onLogin(user);
     } else {
-      setError('Palavra-passe incorreta. Utilize a sua senha, a senha padrão (1111, 2222, 3333) ou "admin123".');
+      setError('Palavra-passe incorreta. Por favor, verifique os dados introduzidos.');
     }
   };
 

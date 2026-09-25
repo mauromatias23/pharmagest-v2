@@ -11,6 +11,7 @@ export interface User {
   role: UserRole;
   active: boolean;
   password?: string;
+  passwordUpdatedAt?: number;
 }
 
 export enum ProductPriceType {

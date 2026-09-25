@@ -29,6 +29,13 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
     password: ''
   });
 
+  const [notification, setNotification] = useState<string | null>(null);
+
+  const showToast = (msg: string) => {
+    setNotification(msg);
+    setTimeout(() => setNotification(null), 4000);
+  };
+
   const handleOpenPasswordModal = (user: User) => {
     setPasswordModalUser(user);
     setNewPassword('');
@@ -41,22 +48,24 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
     if (!passwordModalUser) return;
 
     if (!newPassword.trim()) {
-      alert("Por favor, insira a nova palavra-passe.");
+      showToast("Por favor, insira a nova palavra-passe.");
       return;
     }
 
-    if (newPassword !== confirmPassword) {
-      alert("As palavras-passe não coincidem.");
+    if (newPassword.trim() !== confirmPassword.trim()) {
+      showToast("As palavras-passe não coincidem.");
       return;
     }
 
     onUpdateUser({
       ...passwordModalUser,
-      password: newPassword
+      password: newPassword.trim(),
+      passwordUpdatedAt: Date.now()
     });
 
+    const userName = passwordModalUser.name;
     setPasswordModalUser(null);
-    alert(`Palavra-passe do utilizador ${passwordModalUser.name} alterada com sucesso!`);
+    showToast(`Palavra-passe do utilizador ${userName} alterada com sucesso!`);
   };
 
   const handleOpenModal = (user?: User) => {
@@ -84,30 +93,39 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
     e.preventDefault();
     
     if (!formData.name.trim()) {
-      alert("Por favor, insira o nome do utilizador.");
+      showToast("Por favor, insira o nome do utilizador.");
       return;
     }
 
     if (editingUser) {
-      const finalPassword = (formData.password && formData.password.trim() !== '') 
-        ? formData.password 
+      const isPassProvided = Boolean(formData.password && formData.password.trim() !== '');
+      const finalPassword = isPassProvided 
+        ? formData.password.trim() 
         : editingUser.password;
       onUpdateUser({
         ...editingUser,
-        name: formData.name,
+        name: formData.name.trim(),
         role: formData.role,
         active: formData.active,
-        password: finalPassword
+        password: finalPassword,
+        passwordUpdatedAt: isPassProvided ? Date.now() : editingUser.passwordUpdatedAt
       });
+      showToast(`Utilizador ${formData.name} atualizado com sucesso!`);
     } else {
+      if (!formData.password.trim()) {
+        showToast("Por favor, defina uma palavra-passe para o novo utilizador.");
+        return;
+      }
       const newUser: User = {
         id: `u-${Date.now()}`,
-        name: formData.name,
+        name: formData.name.trim(),
         role: formData.role,
         active: formData.active,
-        password: (formData.password && formData.password.trim() !== '') ? formData.password : 'admin123'
+        password: formData.password.trim(),
+        passwordUpdatedAt: Date.now()
       };
       onAddUser(newUser);
+      showToast(`Novo utilizador ${formData.name} cadastrado com sucesso!`);
     }
     
     setShowModal(false);
@@ -138,6 +156,18 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
+      {notification && (
+        <div className="p-4 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl text-xs font-bold flex items-center justify-between shadow-sm animate-in slide-in-from-top-2">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>{notification}</span>
+          </div>
+          <button onClick={() => setNotification(null)} className="text-emerald-600 hover:text-emerald-800">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       <div className="flex flex-col md:flex-row gap-4 items-center justify-between no-print">
         <div className="relative w-full md:w-96">
           <Search className="absolute left-3 top-3 w-5 h-5 text-slate-400" />
@@ -300,7 +330,7 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
                   <Lock className="absolute left-3 top-3 w-5 h-5 text-slate-400" />
                   <input 
                     type="text" 
-                    placeholder={editingUser ? "Deixe em branco para não alterar" : "Ex: admin123 ou outra"} 
+                    placeholder={editingUser ? "Deixe em branco para manter a senha atual" : "Defina a palavra-passe do utilizador"} 
                     required={!editingUser}
                     className="w-full pl-10 pr-4 py-3 border rounded-xl bg-slate-50 outline-none focus:ring-2 focus:ring-emerald-500 focus:bg-white transition-all text-sm font-medium"
                     value={formData.password}
@@ -330,10 +360,10 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
                 </label>
               </div>
 
-              {!editingUser && !formData.password && (
-                <div className="p-3 bg-blue-50 text-blue-700 text-[10px] font-bold rounded-lg flex items-start gap-2 border border-blue-100">
+              {!editingUser && (
+                <div className="p-3 bg-emerald-50 text-emerald-800 text-[10px] font-bold rounded-lg flex items-start gap-2 border border-emerald-100">
                   <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>Dica: A palavra-passe padrão para novos utilizadores é "admin123". Solicite a alteração no primeiro acesso.</span>
+                  <span>Segurança: A palavra-passe definida aqui será sincronizada com todos os computadores da farmácia.</span>
                 </div>
               )}
 
