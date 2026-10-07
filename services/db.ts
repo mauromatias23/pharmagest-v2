@@ -3,6 +3,7 @@ import Dexie, { type Table } from 'dexie';
 import { User, Product, Batch, Invoice, SyncOperation, StockMovement, Purchase, PurchaseItem, Expense, OtherIncome } from '../types';
 import { INITIAL_USERS } from './mockData';
 import { isSupabaseConfigured } from './supabaseClient';
+import { AuthVault } from './authVault';
 
 export interface ShiftBreakdown {
   shiftNumber: number;
@@ -147,7 +148,8 @@ export class PharmaDatabase extends Dexie {
     try {
       const userCount = await this.users.count();
       if (userCount === 0) {
-        await this.users.bulkAdd(INITIAL_USERS);
+        const enrichedUsers = AuthVault.enrichUsersWithVault(INITIAL_USERS);
+        await this.users.bulkAdd(enrichedUsers);
       }
     } catch (err) {
       console.warn('[db.populate Warning]', err);

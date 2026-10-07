@@ -243,7 +243,7 @@ export class SaleService {
         await db.stockMovements.bulkPut(stockMovementsToCreate);
       }
 
-      // e) Add to syncQueue
+      // e) Add to syncQueue (Fatura)
       await db.syncQueue.add({
         operationId,
         deviceId,
@@ -256,6 +256,44 @@ export class SaleService {
         status: SyncOperationStatus.PENDING,
         attempts: 0
       });
+
+      // f) Add to syncQueue (Lotes atualizados pela venda para propagação na nuvem)
+      for (const bu of batchUpdates) {
+        const batchObj = await db.batches.get(bu.id);
+        if (batchObj) {
+          await db.syncQueue.add({
+            operationId: DeviceService.generateOperationId(),
+            deviceId,
+            userId: input.userId,
+            entityType: 'BATCH',
+            entityId: bu.id,
+            operationType: SyncOperationType.UPDATE,
+            payload: { ...batchObj, quantity: bu.newQty },
+            createdAt: nowIso,
+            status: SyncOperationStatus.PENDING,
+            attempts: 0
+          });
+        }
+      }
+
+      // g) Add to syncQueue (Produtos com stock recalculado para a nuvem)
+      for (const prodId of Object.keys(productDeltas)) {
+        const prodObj = await db.products.get(prodId);
+        if (prodObj) {
+          await db.syncQueue.add({
+            operationId: DeviceService.generateOperationId(),
+            deviceId,
+            userId: input.userId,
+            entityType: 'PRODUCT',
+            entityId: prodId,
+            operationType: SyncOperationType.UPDATE,
+            payload: prodObj,
+            createdAt: nowIso,
+            status: SyncOperationStatus.PENDING,
+            attempts: 0
+          });
+        }
+      }
     });
 
     // 3. Broadcast local change to other tabs
@@ -379,6 +417,44 @@ export class SaleService {
         status: SyncOperationStatus.PENDING,
         attempts: 0
       });
+
+      // 4. Propagate restored batches and products to syncQueue
+      for (const item of (existing.items || [])) {
+        if (!item.batchId) continue;
+        const bObj = await db.batches.get(item.batchId);
+        if (bObj) {
+          await db.syncQueue.add({
+            operationId: DeviceService.generateOperationId(),
+            deviceId,
+            userId,
+            entityType: 'BATCH',
+            entityId: item.batchId,
+            operationType: SyncOperationType.UPDATE,
+            payload: bObj,
+            createdAt: nowIso,
+            status: SyncOperationStatus.PENDING,
+            attempts: 0
+          });
+        }
+      }
+
+      for (const prodId of Object.keys(productDeltas)) {
+        const pObj = await db.products.get(prodId);
+        if (pObj) {
+          await db.syncQueue.add({
+            operationId: DeviceService.generateOperationId(),
+            deviceId,
+            userId,
+            entityType: 'PRODUCT',
+            entityId: prodId,
+            operationType: SyncOperationType.UPDATE,
+            payload: pObj,
+            createdAt: nowIso,
+            status: SyncOperationStatus.PENDING,
+            attempts: 0
+          });
+        }
+      }
     });
 
     SyncService.broadcastLocalChange();

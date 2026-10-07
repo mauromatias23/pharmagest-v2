@@ -22,6 +22,14 @@ export class DeviceService {
     return id;
   }
 
+  static getOrCreateDeviceId(): string {
+    return this.getDeviceId();
+  }
+
+  getOrCreateDeviceId(): string {
+    return DeviceService.getDeviceId();
+  }
+
   /**
    * Retrieves the human-readable device name (e.g. Caixa 01, Balcão 02, etc.).
    */

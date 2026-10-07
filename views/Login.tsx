@@ -1,9 +1,10 @@
-
 import React, { useState } from 'react';
 import { User, UserRole } from '../types';
-import { Lock, User as UserIcon, ShieldCheck, CloudCheck, HardDrive, Eye, EyeOff } from 'lucide-react';
+import { ShieldCheck, CloudCheck, HardDrive, Eye, EyeOff, AlertCircle } from 'lucide-react';
 import { isSupabaseConfigured } from '../services/supabaseClient';
 import { INITIAL_USERS } from '../services/mockData';
+import { AuthVault } from '../services/authVault';
+import { db } from '../services/db';
 
 interface LoginProps {
   users: User[];
@@ -11,50 +12,21 @@ interface LoginProps {
 }
 
 const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
-  // Garante que a lista de utilizadores nunca está vazia
-  const effectiveUsers = (users && users.length > 0) ? users : INITIAL_USERS;
+  // Garante que a lista de utilizadores nunca está vazia e está enriquecida com o cofre de credenciais
+  const baseUsers = (users && users.length > 0) ? users : INITIAL_USERS;
+  const effectiveUsers = AuthVault.enrichUsersWithVault(baseUsers);
 
   const [selectedUserId, setSelectedUserId] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
 
-  // Validação segura de credenciais: a senha cadastrada do utilizador é estritamente exigida
-  const checkPassword = (user: User, inputPass: string): boolean => {
-    const cleanInput = (inputPass || '').trim();
-    if (!cleanInput) return false;
-
-    // 1. Verificar senha armazenada do utilizador
-    const storedPass = (user.password !== undefined && user.password !== null) 
-      ? String(user.password).trim() 
-      : '';
-    
-    // Se o utilizador possui senha cadastrada, APENAS essa senha é válida
-    if (storedPass !== '') {
-      return cleanInput === storedPass;
-    }
-
-    // 2. Se e somente se o utilizador NUNCA tiver tido uma senha definida (primeiro acesso de fábrica):
-    // Aceita a senha inicial padrão estritamente de acordo com o identificador
-    if (user.role === UserRole.ADMIN || user.id === 'u-admin') {
-      return cleanInput === '1111';
-    }
-    if (user.id === 'u-f1') {
-      return cleanInput === '2222';
-    }
-    if (user.id === 'u-f2') {
-      return cleanInput === '3333';
-    }
-
-    return false;
-  };
-
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
     if (!selectedUserId) {
-      setError('Por favor, selecione um utilizador na lista.');
+      setError('Por favor, selecione o seu utilizador na lista.');
       return;
     }
     
@@ -64,22 +36,32 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
       return;
     }
 
-    // Se for administrador, nunca bloqueia por segurança
+    // Se a conta estiver desativada (exceto administrador que nunca é bloqueado)
     if (user.active === false && user.role !== UserRole.ADMIN && user.id !== 'u-admin') {
-      setError('Esta conta está desativada. Contacte o Administrador.');
+      setError('Esta conta está desativada. Contacte o Administrador da farmácia.');
       return;
     }
 
-    const isValid = checkPassword(user, password);
+    const isValid = AuthVault.verifyPassword(user, password);
 
     if (isValid) {
       // Reativa automaticamente caso o admin estivesse marcado como inativo
       if (user.active === false) {
         user.active = true;
       }
+      
+      // Guarda a credencial no AuthVault para persistência garantida
+      const trimmedInput = password.trim();
+      if (trimmedInput !== '') {
+        user.password = trimmedInput;
+        user.passwordUpdatedAt = Date.now();
+        AuthVault.saveCredential(user);
+        db.users.put(user).catch(() => {});
+      }
+
       onLogin(user);
     } else {
-      setError('Palavra-passe incorreta. Por favor, verifique os dados introduzidos.');
+      setError('Palavra-passe incorreta. Por favor verifique os dados introduzidos.');
     }
   };
 
@@ -103,9 +85,9 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
         
         <form onSubmit={handleLogin} className="p-8 space-y-5 text-center flex flex-col items-center w-full">
           {error && (
-            <div id="login-error-alert" className="w-full p-3.5 bg-red-50 text-red-600 text-[11px] font-bold rounded-xl border border-red-100 flex items-center justify-center gap-2 text-center animate-in slide-in-from-top-2">
-              <div className="w-5 h-5 bg-red-100 rounded-full flex items-center justify-center text-red-600 shrink-0 text-center font-black">!</div>
-              <span className="text-center">{error}</span>
+            <div id="login-error-alert" className="w-full p-3.5 bg-amber-50 text-amber-800 text-xs font-bold rounded-xl border border-amber-200 flex items-center justify-center gap-2 text-center animate-in slide-in-from-top-2">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>{error}</span>
             </div>
           )}
 
@@ -135,9 +117,11 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
           </div>
 
           <div className="w-full space-y-1.5 text-center flex flex-col items-center">
-            <label className="block w-full text-xs font-black text-slate-700 uppercase tracking-widest text-center">
-              Palavra-passe
-            </label>
+            <div className="w-full flex justify-between items-center px-1">
+              <label className="text-xs font-black text-slate-700 uppercase tracking-widest text-left">
+                Palavra-passe
+              </label>
+            </div>
             <div className="relative w-full">
               <input 
                 id="login-password-input"
@@ -147,7 +131,7 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
                   setPassword(e.target.value);
                   setError('');
                 }}
-                placeholder="Introduza a palavra-passe"
+                placeholder="Introduza a sua palavra-passe"
                 className="w-full pl-10 pr-10 py-3.5 border rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-slate-50 outline-none transition-all font-mono text-center tracking-widest placeholder:text-center placeholder:text-xs placeholder:font-sans placeholder:tracking-normal"
                 style={{ textAlign: 'center' }}
               />
@@ -155,7 +139,7 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
                 id="login-toggle-password"
                 type="button"
                 onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1"
+                className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-1 cursor-pointer"
                 title={showPassword ? "Ocultar palavra-passe" : "Ver palavra-passe"}
               >
                 {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
@@ -171,17 +155,17 @@ const Login: React.FC<LoginProps> = ({ users, onLogin }) => {
             Entrar no Sistema
           </button>
 
-          <div className="w-full text-center pt-1 flex items-center justify-center">
-            <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest flex items-center justify-center gap-1.5 text-center w-full">
+          <div className="w-full text-center pt-2 flex flex-col items-center justify-center gap-2">
+            <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest flex items-center justify-center gap-1.5 text-center w-full mt-1">
               {isSupabaseConfigured() ? (
                 <>
                   <CloudCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                  <span className="text-center">Sincronização Automática com Supabase Ativa</span>
+                  <span className="text-center">Sincronização em Nuvem Ativa</span>
                 </>
               ) : (
                 <>
                   <HardDrive className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                  <span className="text-center">Modo Local - IndexedDB Ativo</span>
+                  <span className="text-center">Modo Local - Armazenamento Seguro</span>
                 </>
               )}
             </p>

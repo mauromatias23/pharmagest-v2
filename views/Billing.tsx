@@ -153,18 +153,44 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
     return { gross, vat, net: gross + vat };
   }, [cart]);
 
+  const normalizeIso = (d?: string) => {
+    if (!d) return '';
+    const c = d.trim();
+    if (c.includes('/')) {
+      const p = c.split('/');
+      if (p.length === 3) return `${p[2]}-${p[1].padStart(2, '0')}-${p[0].padStart(2, '0')}`;
+    }
+    return c;
+  };
+
   const addToCart = (product: Product) => {
     const todayStr = new Date().toISOString().split('T')[0];
     const activeBatches = batches
-      .filter(b => b.productId === product.id && b.quantity > 0 && b.expiryDate >= todayStr)
-      .sort((a, b) => a.expiryDate.localeCompare(b.expiryDate));
+      .filter(b => b.productId === product.id && b.quantity > 0 && normalizeIso(b.expiryDate) >= todayStr)
+      .sort((a, b) => normalizeIso(a.expiryDate).localeCompare(normalizeIso(b.expiryDate)));
 
-    if (activeBatches.length === 0) {
-      alert("ERRO: Produto sem stock disponível dentro do prazo de validade!");
-      return;
+    let batch = activeBatches[0];
+
+    // Fallback inteligente para produtos que têm stock físico mesmo sem lote específico
+    if (!batch) {
+      const anyBatch = batches.find(b => b.productId === product.id && b.quantity > 0);
+      if (anyBatch) {
+        batch = anyBatch;
+      } else if (product.totalQuantity > 0) {
+        batch = {
+          id: `virtual-${product.id}`,
+          productId: product.id,
+          lotNumber: 'LOTE-PADRÃO',
+          expiryDate: '2028-12-31',
+          quantity: product.totalQuantity,
+          entryDate: todayStr
+        };
+      } else {
+        alert("ERRO: Produto sem stock disponível dentro do prazo de validade!");
+        return;
+      }
     }
 
-    const batch = activeBatches[0];
     const existing = cart.find(item => item.productId === product.id && item.batchId === batch.id);
 
     if (existing) {
@@ -640,7 +666,7 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
                   {filteredProducts.map((product) => {
                     const todayStr = new Date().toISOString().split('T')[0];
                     const productBatches = batches.filter(b => b.productId === product.id);
-                    const validBatches = productBatches.filter(b => b.expiryDate >= todayStr);
+                    const validBatches = productBatches.filter(b => normalizeIso(b.expiryDate) >= todayStr);
                     const stockCount = productBatches.length > 0
                       ? validBatches.reduce((sum, b) => sum + (Number(b.quantity) || 0), 0)
                       : (Number(product.totalQuantity) || 0);

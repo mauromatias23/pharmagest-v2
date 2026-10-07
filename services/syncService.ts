@@ -11,6 +11,7 @@ import {
   SyncOperationType
 } from '../types';
 import { DeviceService } from './deviceService';
+import { AuthVault } from './authVault';
 
 let realtimeChannel: any = null;
 let autoReconnectInterval: any = null;
@@ -266,16 +267,22 @@ export const SyncService = {
           return;
         }
 
+        const vaultCred = AuthVault.getCredential(userId);
+        const finalPass = (newRecord.password && String(newRecord.password).trim() !== '') 
+          ? String(newRecord.password).trim() 
+          : (local?.password || vaultCred?.password || undefined);
+
         const u: User = {
           id: newRecord.id,
           name: newRecord.name,
           role: newRecord.role as UserRole,
           active: newRecord.active ?? true,
-          password: (newRecord.password && String(newRecord.password).trim() !== '') 
-            ? String(newRecord.password).trim() 
-            : (local?.password || undefined),
-          passwordUpdatedAt: local?.passwordUpdatedAt
+          password: finalPass,
+          passwordUpdatedAt: local?.passwordUpdatedAt || vaultCred?.passwordUpdatedAt
         };
+        if (finalPass) {
+          AuthVault.saveCredential(u);
+        }
         await db.users.put(u);
       }
     } catch (err) {
@@ -504,6 +511,28 @@ export const SyncService = {
                   vat_amount: Number(it.vatAmount) || 0
                 }));
                 await supabase.from('invoice_items').upsert(itemsToUpsert, { onConflict: 'id' });
+                
+                // Atualizar quantidades nos lotes e produtos do Supabase para refletir a venda
+                for (const it of inv.items) {
+                  if (it.batchId) {
+                    try {
+                      const { data: bRow } = await supabase.from('batches').select('quantity').eq('id', it.batchId).maybeSingle();
+                      if (bRow) {
+                        const newQ = Math.max(0, (Number(bRow.quantity) || 0) - (Number(it.quantity) || 0));
+                        await supabase.from('batches').update({ quantity: newQ }).eq('id', it.batchId);
+                      }
+                    } catch (bErr) {}
+                  }
+                  if (it.productId) {
+                    try {
+                      const { data: allB } = await supabase.from('batches').select('quantity').eq('product_id', it.productId);
+                      if (allB) {
+                        const tot = allB.reduce((sum, b) => sum + Math.max(0, Number(b.quantity) || 0), 0);
+                        await supabase.from('products').update({ total_quantity: tot }).eq('id', it.productId);
+                      }
+                    } catch (pErr) {}
+                  }
+                }
               }
               opSuccess = true;
               await db.invoices.update(inv.id, { synchronized: true });
@@ -810,6 +839,8 @@ export const SyncService = {
     pushedInvoices: number; 
     pushedItems: number; 
     pushedClosures: number; 
+    pushedProducts?: number;
+    pushedBatches?: number;
     message: string 
   }> {
     if (!this.isConfigured()) {
@@ -867,26 +898,34 @@ export const SyncService = {
       }
 
       // 2. Enviar Produtos locais (estritamente ativos e NÃO eliminados)
+      const allLocalBatches = await db.batches.toArray();
       const allLocalProducts = await db.products.toArray();
       const localProducts = allLocalProducts.filter(p => !deletedProductIds.has(p.id) && p.active !== false);
       const validProductIds = new Set<string>();
       if (localProducts.length > 0) {
-        const productsData = localProducts.map(p => ({
-          id: p.id,
-          code: p.code,
-          name: p.name,
-          active_ingredient: p.activeIngredient,
-          category: p.category,
-          type: p.type || null,
-          price_type: p.priceType,
-          cost_price: p.costPrice,
-          sell_price: p.sellPrice,
-          has_vat: p.hasVAT,
-          supplier: p.supplier || null,
-          min_stock: p.minStock,
-          total_quantity: p.totalQuantity,
-          active: p.active
-        }));
+        const productsData = localProducts.map(p => {
+          const prodBatches = allLocalBatches.filter(b => b.productId === p.id && !deletedBatchIds.has(b.id));
+          const consolidatedStock = prodBatches.length > 0
+            ? prodBatches.reduce((acc, b) => acc + Math.max(0, Number(b.quantity) || 0), 0)
+            : Math.max(0, Number(p.totalQuantity) || 0);
+
+          return {
+            id: p.id,
+            code: p.code,
+            name: p.name,
+            active_ingredient: p.activeIngredient,
+            category: p.category,
+            type: p.type || null,
+            price_type: p.priceType,
+            cost_price: p.costPrice,
+            sell_price: p.sellPrice,
+            has_vat: p.hasVAT,
+            supplier: p.supplier || null,
+            min_stock: p.minStock,
+            total_quantity: consolidatedStock,
+            active: p.active
+          };
+        });
         // Envio em lotes de 50 produtos para evitar limites de payload
         for (let i = 0; i < productsData.length; i += 50) {
           const chunk = productsData.slice(i, i + 50);
@@ -908,7 +947,6 @@ export const SyncService = {
       }
 
       // 3. Enviar Lotes locais (estritamente não eliminados e de produtos válidos)
-      const allLocalBatches = await db.batches.toArray();
       const validBatchIds = new Set<string>();
       if (allLocalBatches.length > 0) {
         const safeBatches = allLocalBatches.filter(b => 
@@ -1095,14 +1133,16 @@ export const SyncService = {
         console.warn('[pushAllLocalToSupabase] Aviso ao marcar faturas como sincronizadas:', modErr);
       }
 
-      const totalPushed = pushedInvoicesCount + pushedItemsCount + pushedClosuresCount + localProducts.length;
+      const totalPushed = pushedInvoicesCount + pushedItemsCount + pushedClosuresCount + validProductIds.size + validBatchIds.size;
       return {
         success: true,
         pushed: totalPushed,
         pushedInvoices: pushedInvoicesCount,
         pushedItems: pushedItemsCount,
         pushedClosures: pushedClosuresCount,
-        message: `${pushedInvoicesCount} faturas (incluindo período 11/09 a 21/09) e ${pushedClosuresCount} fechos locais enviados com sucesso para o Supabase!`
+        pushedProducts: validProductIds.size,
+        pushedBatches: validBatchIds.size,
+        message: `${validProductIds.size} produtos/stocks, ${validBatchIds.size} lotes, ${pushedInvoicesCount} faturas e ${pushedClosuresCount} fechos locais atualizados com sucesso no Supabase!`
       };
     } catch (err: any) {
       if (isQuotaExceededError(err)) {
@@ -1260,14 +1300,17 @@ export const SyncService = {
           return local;
         }
 
-        let finalPassword = local?.password;
-        // Se a senha local foi alterada pelo utilizador nesta máquina (tem passwordUpdatedAt):
-        if (local?.passwordUpdatedAt && local.password) {
+        const vaultCred = AuthVault.getCredential(u.id);
+        let finalPassword = local?.password || vaultCred?.password;
+        let finalPasswordUpdatedAt = local?.passwordUpdatedAt || vaultCred?.passwordUpdatedAt;
+
+        if (vaultCred?.password && (!finalPassword || (vaultCred.passwordUpdatedAt && vaultCred.passwordUpdatedAt >= (finalPasswordUpdatedAt || 0)))) {
+          finalPassword = vaultCred.password;
+          finalPasswordUpdatedAt = vaultCred.passwordUpdatedAt;
+        } else if (local?.passwordUpdatedAt && local.password) {
           finalPassword = local.password;
         } else if (u.password && String(u.password).trim() !== '') {
           finalPassword = String(u.password).trim();
-        } else {
-          finalPassword = local?.password;
         }
 
         if (!finalPassword) {
@@ -1280,14 +1323,20 @@ export const SyncService = {
           }
         }
 
-        return {
+        const enrichedUser: User = {
           id: u.id,
           name: (hasPendingLocalOp || local?.passwordUpdatedAt) && local ? local.name : u.name,
           role: ((hasPendingLocalOp || local?.passwordUpdatedAt) && local ? local.role : u.role) as UserRole,
           active: (hasPendingLocalOp || local?.passwordUpdatedAt) && local ? local.active : (u.active ?? true),
           password: finalPassword,
-          passwordUpdatedAt: local?.passwordUpdatedAt
+          passwordUpdatedAt: finalPasswordUpdatedAt
         };
+
+        if (finalPassword) {
+          AuthVault.saveCredential(enrichedUser);
+        }
+
+        return enrichedUser;
       });
 
       // Preservar utilizadores criados localmente que ainda não constam na nuvem
@@ -1424,17 +1473,20 @@ export const SyncService = {
           // Lote novo que veio do Supabase
           finalBatchesToSave.push(remoteB);
         } else {
-          // Se houver alteração pendente local, prevalece o local
+          // Se houver alteração pendente local ou se o lote local foi modificado/ajustado
           if (pendingBatchOps.has(remoteB.id)) {
             finalBatchesToSave.push(localB);
           } else {
-            // Em caso de divergência de stock onde o local sofreu baixas de faturação offline,
-            // preservamos a quantidade mais conservadora/realista local
+            // Preserva a quantidade local mais fidedigna à realidade da empresa:
+            // NUNCA reduz forçadamente com Math.min, evitando anular acertos de stock e compras!
             const localQty = Number(localB.quantity) || 0;
             const remoteQty = Number(remoteB.quantity) || 0;
-            const chosenQty = (localQty < remoteQty) ? localQty : remoteQty;
+            // Se local tem quantidade válida, ela reflete as contagens e vendas locais
+            const chosenQty = localB.quantity !== undefined ? localQty : remoteQty;
             finalBatchesToSave.push({
               ...remoteB,
+              lotNumber: localB.lotNumber || remoteB.lotNumber,
+              expiryDate: localB.expiryDate || remoteB.expiryDate,
               quantity: Math.max(0, chosenQty)
             });
           }
@@ -1457,12 +1509,12 @@ export const SyncService = {
 
       for (const remoteP of mappedProducts) {
         processedProductIds.add(remoteP.id);
+        const localP = localProductMap.get(remoteP.id);
         const prodBatches = finalBatchesToSave.filter(b => b.productId === remoteP.id);
         const accurateStock = prodBatches.length > 0
           ? Math.max(0, prodBatches.reduce((sum, b) => sum + Math.max(0, Number(b.quantity) || 0), 0))
-          : Math.max(0, Number(remoteP.totalQuantity) || 0);
+          : Math.max(0, Number(localP?.totalQuantity !== undefined ? localP.totalQuantity : remoteP.totalQuantity) || 0);
 
-        const localP = localProductMap.get(remoteP.id);
         finalProductsToSave.push({
           ...remoteP,
           sellPrice: localP?.sellPrice !== undefined ? localP.sellPrice : remoteP.sellPrice,
@@ -2692,7 +2744,8 @@ export const SyncService = {
       passwordUpdatedAt: user.passwordUpdatedAt || Date.now()
     };
 
-    // 1. Salvar no Dexie local imediatamente
+    // 1. Guardar no AuthVault e no Dexie local imediatamente
+    AuthVault.saveCredential(newUser);
     await db.users.put(newUser);
     this.broadcastLocalChange();
 
@@ -2720,13 +2773,24 @@ export const SyncService = {
     const supabase = getSupabase();
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
-        const { error } = await supabase.from('users').upsert({
+        let { error } = await supabase.from('users').upsert({
           id: newUser.id,
           name: newUser.name,
           role: newUser.role,
           active: newUser.active ?? true,
           password: newUser.password || null
         }, { onConflict: 'id' });
+
+        // Se a coluna password não existir no Supabase, tenta enviar sem ela para não quebrar a sincronização
+        if (error && error.message?.toLowerCase().includes('password')) {
+          const retryRes = await supabase.from('users').upsert({
+            id: newUser.id,
+            name: newUser.name,
+            role: newUser.role,
+            active: newUser.active ?? true
+          }, { onConflict: 'id' });
+          error = retryRes.error;
+        }
 
         if (!error) {
           if (opQueueId) {
@@ -2756,7 +2820,8 @@ export const SyncService = {
       passwordUpdatedAt: user.passwordUpdatedAt || Date.now()
     };
 
-    // 1. Salvar no Dexie local imediatamente
+    // 1. Guardar no AuthVault e no Dexie local imediatamente
+    AuthVault.saveCredential(updatedUser);
     await db.users.put(updatedUser);
     this.broadcastLocalChange();
 
@@ -2784,13 +2849,24 @@ export const SyncService = {
     const supabase = getSupabase();
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
-        const { error } = await supabase.from('users').upsert({
+        let { error } = await supabase.from('users').upsert({
           id: updatedUser.id,
           name: updatedUser.name,
           role: updatedUser.role,
           active: updatedUser.active,
           password: updatedUser.password || null
         }, { onConflict: 'id' });
+
+        // Se a coluna password não existir no Supabase, tenta enviar sem ela para não quebrar a sincronização
+        if (error && error.message?.toLowerCase().includes('password')) {
+          const retryRes = await supabase.from('users').upsert({
+            id: updatedUser.id,
+            name: updatedUser.name,
+            role: updatedUser.role,
+            active: updatedUser.active
+          }, { onConflict: 'id' });
+          error = retryRes.error;
+        }
 
         if (!error) {
           if (opQueueId) {

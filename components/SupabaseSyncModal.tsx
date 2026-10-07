@@ -268,6 +268,10 @@ CREATE TABLE IF NOT EXISTS public.daily_closures (
 -- 8. UPGRADE EXISTING COLUMNS AND FOREIGN KEYS TO ON DELETE CASCADE (Safe for existing databases)
 DO $$ 
 BEGIN
+    -- Add missing columns to users if they were created earlier
+    ALTER TABLE IF EXISTS public.users ADD COLUMN IF NOT EXISTS password TEXT;
+    ALTER TABLE IF EXISTS public.users ADD COLUMN IF NOT EXISTS password_updated_at BIGINT;
+
     -- Add missing columns to invoices if they were created earlier
     ALTER TABLE IF EXISTS public.invoices ADD COLUMN IF NOT EXISTS closed BOOLEAN DEFAULT FALSE;
     ALTER TABLE IF EXISTS public.invoices ADD COLUMN IF NOT EXISTS closure_id TEXT;
@@ -619,20 +623,20 @@ END $$;
                     </div>
 
                     <p className="text-[11px] text-amber-950/80 leading-relaxed">
-                      Se o seu Supabase esteve inacessível ou com limite de quota de tráfego entre 11/09 e 21/09, todas as vendas foram guardadas em segurança no armazenamento local deste navegador. Clique no botão de <strong>Enviar Vendas Locais (Upload)</strong> para lançá-las de imediato no Supabase.
+                      Se organizou ou recontou os medicamentos localmente neste computador, clique no botão <strong>Atualizar Supabase c/ Dados Locais</strong> para enviar todos os stocks reais, lotes conferidos e faturas para o Supabase, atualizando a nuvem de forma prioritária com a verdade deste terminal.
                     </p>
                   </div>
 
-                  {/* Botões de Ação */}
                   {/* Botões de Ação */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <button
                       onClick={handlePushLocalOnly}
                       disabled={isPushingLocal || isSyncing}
                       className="px-4 py-3.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-black text-xs uppercase tracking-wider shadow-lg shadow-amber-600/20 flex items-center justify-center gap-2.5 transition-all disabled:bg-slate-300 disabled:shadow-none cursor-pointer"
+                      title="Envia todos os produtos com stocks atuais, lotes e faturas deste computador para o Supabase"
                     >
                       <UploadCloud className={`w-4 h-4 ${isPushingLocal ? 'animate-bounce' : ''}`} />
-                      {isPushingLocal ? 'A Enviar para Supabase...' : 'Enviar Vendas Locais (Upload)'}
+                      {isPushingLocal ? 'A Atualizar Supabase...' : 'Atualizar Supabase c/ Dados Locais (Upload)'}
                     </button>
 
                     <button

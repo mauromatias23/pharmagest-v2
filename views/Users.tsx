@@ -2,6 +2,7 @@
 import React, { useState } from 'react';
 import { User, UserRole } from '../types';
 import { Search, Plus, UserPlus, Shield, User as UserIcon, MoreVertical, Edit2, Trash2, X, CheckCircle2, AlertCircle, Key, Lock, Eye, EyeOff } from 'lucide-react';
+import { AuthVault } from '../services/authVault';
 
 interface UsersProps {
   users: User[];
@@ -57,11 +58,13 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
       return;
     }
 
-    onUpdateUser({
+    const updatedUserWithPass: User = {
       ...passwordModalUser,
       password: newPassword.trim(),
       passwordUpdatedAt: Date.now()
-    });
+    };
+    AuthVault.saveCredential(updatedUserWithPass);
+    onUpdateUser(updatedUserWithPass);
 
     const userName = passwordModalUser.name;
     setPasswordModalUser(null);
@@ -102,14 +105,16 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
       const finalPassword = isPassProvided 
         ? formData.password.trim() 
         : editingUser.password;
-      onUpdateUser({
+      const updatedUser: User = {
         ...editingUser,
         name: formData.name.trim(),
         role: formData.role,
         active: formData.active,
         password: finalPassword,
         passwordUpdatedAt: isPassProvided ? Date.now() : editingUser.passwordUpdatedAt
-      });
+      };
+      AuthVault.saveCredential(updatedUser);
+      onUpdateUser(updatedUser);
       showToast(`Utilizador ${formData.name} atualizado com sucesso!`);
     } else {
       if (!formData.password.trim()) {
@@ -124,6 +129,7 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
         password: formData.password.trim(),
         passwordUpdatedAt: Date.now()
       };
+      AuthVault.saveCredential(newUser);
       onAddUser(newUser);
       showToast(`Novo utilizador ${formData.name} cadastrado com sucesso!`);
     }
@@ -131,7 +137,9 @@ const Users: React.FC<UsersProps> = ({ users, onAddUser, onUpdateUser, onDeleteU
     setShowModal(false);
   };
 
-  const filteredUsers = users.filter(u => 
+  const effectiveUsers = AuthVault.enrichUsersWithVault(users);
+
+  const filteredUsers = effectiveUsers.filter(u => 
     u.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
     u.role.toLowerCase().includes(searchTerm.toLowerCase())
   );

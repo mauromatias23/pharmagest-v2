@@ -12,6 +12,7 @@ import Login from './views/Login';
 import Users from './views/Users';
 import { RecoveryBilling } from './views/RecoveryBilling';
 import { INITIAL_USERS } from './services/mockData';
+import { AuthVault } from './services/authVault';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -61,8 +62,11 @@ const App: React.FC = () => {
 
       let finalUsers = u;
       if (!finalUsers || finalUsers.length === 0) {
-        await db.users.bulkPut(INITIAL_USERS);
-        finalUsers = INITIAL_USERS;
+        const enrichedInitial = AuthVault.enrichUsersWithVault(INITIAL_USERS);
+        await db.users.bulkPut(enrichedInitial);
+        finalUsers = enrichedInitial;
+      } else {
+        finalUsers = AuthVault.enrichUsersWithVault(finalUsers);
       }
 
       setUsers(finalUsers);
@@ -450,6 +454,7 @@ const App: React.FC = () => {
       return;
     }
     try {
+      AuthVault.saveCredential(user);
       await SyncService.createUser(user);
       await reloadLocalData();
     } catch (err: any) {
@@ -464,6 +469,7 @@ const App: React.FC = () => {
       return;
     }
     try {
+      AuthVault.saveCredential(user);
       await SyncService.updateUser(user);
       await reloadLocalData();
       if (currentUser?.id === user.id) {
