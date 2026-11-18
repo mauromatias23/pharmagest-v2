@@ -8,6 +8,12 @@ import {
   SyncOperationType, 
   SyncOperationStatus 
 } from '../types';
+import { VAT_RATE } from '../constants';
+import {
+  roundMoney,
+  getCanonicalPaymentLabel,
+  calculateItemTotals
+} from '../utils/financeUtils';
 import { DeviceService } from './deviceService';
 import { SyncService } from './syncService';
 
@@ -35,6 +41,7 @@ export interface CartItemInput {
 
 export interface CreateSaleInput {
   invoiceId?: string;
+  id?: string;
   invoiceNumber: string;
   customerId?: string;
   customerName?: string;
@@ -47,6 +54,8 @@ export interface CreateSaleInput {
   items: (CartItemInput | InvoiceItem)[] | any[];
   date?: string;
   createdAt?: string;
+  closed?: boolean;
+  closureId?: string;
   isRetroactive?: boolean;
   retroactiveType?: string;
   originalSaleDate?: string;
@@ -60,12 +69,24 @@ export class SaleService {
   static async completeSale(input: CreateSaleInput): Promise<{ success: boolean; invoice: Invoice; message?: string }> {
     const operationId = DeviceService.generateOperationId();
     const deviceId = DeviceService.getDeviceId();
-    const invoiceId = input.invoiceId || operationId;
+    const invoiceId = input.invoiceId || input.id || operationId;
+
+    // Guard de idempotência: se esta fatura já foi gravada localmente, nunca deduzir stock duas vezes
+    const existingInvoice = await db.invoices.get(invoiceId);
+    if (existingInvoice) {
+      return {
+        success: true,
+        invoice: existingInvoice,
+        message: 'Venda já registrada anteriormente.'
+      };
+    }
+
     const nowIso = input.date || new Date().toISOString();
+    const canonicalPayment = getCanonicalPaymentLabel(input.paymentMethod);
 
     const flattenedItems: InvoiceItem[] = [];
     const stockMovementsToCreate: StockMovement[] = [];
-    const batchUpdates: Array<{ id: string; newQty: number }> = [];
+    const batchDeltas: Record<string, number> = {};
     const productDeltas: Record<string, number> = {};
 
     let totalGross = 0;
@@ -81,16 +102,23 @@ export class SaleService {
         if (qty <= 0) continue;
 
         const unitPrice = Number(rawItem.unitPrice) || 0;
-        const subtotal = rawItem.subtotal ?? (unitPrice * qty);
-        const vatAmount = rawItem.vatAmount ?? 0;
-        const costPriceHist = rawItem.costPriceHistorical ?? 0;
-        const totalCostHist = rawItem.totalCostHistorical ?? (costPriceHist * qty);
+        const subtotal = rawItem.subtotal !== undefined ? roundMoney(rawItem.subtotal) : roundMoney(unitPrice * qty);
+        const vatAmount = rawItem.vatAmount !== undefined ? roundMoney(rawItem.vatAmount) : 0;
+        const costPriceHist = Number(rawItem.costPriceHistorical) || 0;
+        const totalCostHist = rawItem.totalCostHistorical !== undefined ? roundMoney(rawItem.totalCostHistorical) : roundMoney(costPriceHist * qty);
 
-        totalGross += (subtotal - vatAmount);
+        // subtotal é a base tributável (sem IVA); totalNet = totalGross + totalVAT = soma(subtotal + vatAmount)
+        totalGross += subtotal;
         totalVAT += vatAmount;
         totalCostCMV += totalCostHist;
 
-        flattenedItems.push(rawItem);
+        flattenedItems.push({
+          ...rawItem,
+          quantity: qty,
+          unitPrice,
+          subtotal,
+          vatAmount
+        });
 
         // Track stock movement for audit
         stockMovementsToCreate.push({
@@ -111,36 +139,30 @@ export class SaleService {
           createdAt: input.createdAt || nowIso
         });
 
-        if (rawItem.batchId) {
-          const currentBatch = await db.batches.get(rawItem.batchId);
-          if (currentBatch) {
-            batchUpdates.push({
-              id: rawItem.batchId,
-              newQty: Math.max(0, (currentBatch.quantity || 0) - qty)
-            });
-          }
+        if (rawItem.batchId && !rawItem.batchId.startsWith('virtual-')) {
+          batchDeltas[rawItem.batchId] = (batchDeltas[rawItem.batchId] || 0) + qty;
         }
 
-        productDeltas[rawItem.productId] = (productDeltas[rawItem.productId] || 0) + qty;
+        if (rawItem.productId) {
+          productDeltas[rawItem.productId] = (productDeltas[rawItem.productId] || 0) + qty;
+        }
       }
     } else {
       // 1. Process cart items and apportion batches
       for (const item of (input.items as CartItemInput[])) {
         const p = item.product;
         if (!p) continue;
-        const unitPrice = p.sellPrice;
-        const vatRate = p.hasVAT ? 0.14 : 0;
+        const unitPrice = Number(p.sellPrice) || 0;
 
         for (const bAlloc of (item.batches || [])) {
           if (bAlloc.quantityToTake <= 0) continue;
           const b = bAlloc.batch;
-          const qty = bAlloc.quantityToTake;
-          const subtotal = unitPrice * qty;
-          const vatAmount = subtotal * (vatRate / (1 + vatRate));
-          const costPriceHist = p.costPrice || 0;
-          const totalCostHist = costPriceHist * qty;
+          const qty = Number(bAlloc.quantityToTake) || 0;
+          const { subtotal, vatAmount } = calculateItemTotals(qty, unitPrice, p.hasVAT !== false, VAT_RATE);
+          const costPriceHist = Number(p.costPrice) || 0;
+          const totalCostHist = roundMoney(costPriceHist * qty);
 
-          totalGross += (subtotal - vatAmount);
+          totalGross += subtotal;
           totalVAT += vatAmount;
           totalCostCMV += totalCostHist;
 
@@ -179,17 +201,19 @@ export class SaleService {
             createdAt: input.createdAt || nowIso
           });
 
-          batchUpdates.push({
-            id: b.id,
-            newQty: Math.max(0, (b.quantity || 0) - qty)
-          });
+          if (b.id && !b.id.startsWith('virtual-')) {
+            batchDeltas[b.id] = (batchDeltas[b.id] || 0) + qty;
+          }
 
           productDeltas[p.id] = (productDeltas[p.id] || 0) + qty;
         }
       }
     }
 
-    const totalNet = totalGross + totalVAT;
+    totalGross = roundMoney(totalGross);
+    totalVAT = roundMoney(totalVAT);
+    totalCostCMV = roundMoney(totalCostCMV);
+    const totalNet = roundMoney(totalGross + totalVAT);
 
     const newInvoice: Invoice & { synchronized?: boolean } = {
       id: invoiceId,
@@ -211,11 +235,12 @@ export class SaleService {
       totalNet,
       totalCostCMV,
       status: InvoiceStatus.ISSUED,
-      paymentMethod: input.paymentMethod,
+      paymentMethod: canonicalPayment,
       items: flattenedItems,
       shiftNumber: input.shiftNumber,
       shiftName: input.shiftName,
-      closed: false,
+      closed: Boolean(input.closed),
+      closureId: input.closureId,
       synchronized: false
     };
 
@@ -224,16 +249,25 @@ export class SaleService {
       // a) Save invoice
       await db.invoices.put(newInvoice);
 
-      // b) Update batches
-      for (const bu of batchUpdates) {
-        await db.batches.update(bu.id, { quantity: bu.newQty });
+      // b) Update batches atomically using accumulated deltas
+      const updatedBatchIds: string[] = [];
+      for (const [batchId, qtySub] of Object.entries(batchDeltas)) {
+        const currentBatch = await db.batches.get(batchId);
+        if (currentBatch) {
+          const newQty = Math.max(0, (Number(currentBatch.quantity) || 0) - qtySub);
+          await db.batches.update(batchId, { quantity: newQty });
+          updatedBatchIds.push(batchId);
+        }
       }
 
-      // c) Update products total quantity
+      // c) Update products total quantity from actual batches (source of truth)
       for (const [prodId, qtySub] of Object.entries(productDeltas)) {
         const existingProd = await db.products.get(prodId);
         if (existingProd) {
-          const updatedQty = Math.max(0, (existingProd.totalQuantity || 0) - qtySub);
+          const prodBatches = await db.batches.where('productId').equals(prodId).toArray();
+          const updatedQty = prodBatches.length > 0
+            ? Math.max(0, prodBatches.reduce((sum, b) => sum + Math.max(0, Number(b.quantity) || 0), 0))
+            : Math.max(0, (Number(existingProd.totalQuantity) || 0) - qtySub);
           await db.products.update(prodId, { totalQuantity: updatedQty });
         }
       }
@@ -258,17 +292,17 @@ export class SaleService {
       });
 
       // f) Add to syncQueue (Lotes atualizados pela venda para propagação na nuvem)
-      for (const bu of batchUpdates) {
-        const batchObj = await db.batches.get(bu.id);
+      for (const batchId of updatedBatchIds) {
+        const batchObj = await db.batches.get(batchId);
         if (batchObj) {
           await db.syncQueue.add({
             operationId: DeviceService.generateOperationId(),
             deviceId,
             userId: input.userId,
             entityType: 'BATCH',
-            entityId: bu.id,
+            entityId: batchId,
             operationType: SyncOperationType.UPDATE,
-            payload: { ...batchObj, quantity: bu.newQty },
+            payload: batchObj,
             createdAt: nowIso,
             status: SyncOperationStatus.PENDING,
             attempts: 0
@@ -349,20 +383,20 @@ export class SaleService {
         synchronized: false
       });
 
-      // 2. Restore stock for each item
+      // 2. Accumulate stock restoration per batch and product
+      const batchRestores: Record<string, number> = {};
       const productDeltas: Record<string, number> = {};
+
       for (const item of (existing.items || [])) {
-        if (!item.batchId || item.quantity <= 0) continue;
+        const qty = Number(item.quantity) || 0;
+        if (qty <= 0) continue;
 
-        // Restore to batch
-        const batch = await db.batches.get(item.batchId);
-        if (batch) {
-          await db.batches.update(item.batchId, {
-            quantity: (batch.quantity || 0) + item.quantity
-          });
+        if (item.batchId && !item.batchId.startsWith('virtual-')) {
+          batchRestores[item.batchId] = (batchRestores[item.batchId] || 0) + qty;
         }
-
-        productDeltas[item.productId] = (productDeltas[item.productId] || 0) + item.quantity;
+        if (item.productId) {
+          productDeltas[item.productId] = (productDeltas[item.productId] || 0) + qty;
+        }
 
         // Create return stock movement
         movementsToCreate.push({
@@ -372,7 +406,7 @@ export class SaleService {
           productId: item.productId,
           batchId: item.batchId,
           type: StockMovementType.CANCELAMENTO_VENDA,
-          quantity: item.quantity,
+          quantity: qty,
           reference: `Anulação da fatura ${existing.invoiceNumber}`,
           referenceId: invoiceId,
           date: nowIso,
@@ -380,18 +414,31 @@ export class SaleService {
           userName,
           reason,
           unitCost: item.costPriceHistorical || 0,
-          totalCost: (item.costPriceHistorical || 0) * item.quantity,
+          totalCost: (item.costPriceHistorical || 0) * qty,
           createdAt: nowIso
         });
       }
 
-      // Restore product totalQuantity
+      const restoredBatchIds: string[] = [];
+      for (const [batchId, qtyAdd] of Object.entries(batchRestores)) {
+        const batch = await db.batches.get(batchId);
+        if (batch) {
+          await db.batches.update(batchId, {
+            quantity: Math.max(0, (Number(batch.quantity) || 0) + qtyAdd)
+          });
+          restoredBatchIds.push(batchId);
+        }
+      }
+
+      // Restore product totalQuantity from actual batches when present
       for (const [prodId, qtyAdd] of Object.entries(productDeltas)) {
         const prod = await db.products.get(prodId);
         if (prod) {
-          await db.products.update(prodId, {
-            totalQuantity: (prod.totalQuantity || 0) + qtyAdd
-          });
+          const prodBatches = await db.batches.where('productId').equals(prodId).toArray();
+          const newTotal = prodBatches.length > 0
+            ? Math.max(0, prodBatches.reduce((sum, b) => sum + Math.max(0, Number(b.quantity) || 0), 0))
+            : Math.max(0, (Number(prod.totalQuantity) || 0) + qtyAdd);
+          await db.products.update(prodId, { totalQuantity: newTotal });
         }
       }
 
@@ -419,16 +466,15 @@ export class SaleService {
       });
 
       // 4. Propagate restored batches and products to syncQueue
-      for (const item of (existing.items || [])) {
-        if (!item.batchId) continue;
-        const bObj = await db.batches.get(item.batchId);
+      for (const batchId of restoredBatchIds) {
+        const bObj = await db.batches.get(batchId);
         if (bObj) {
           await db.syncQueue.add({
             operationId: DeviceService.generateOperationId(),
             deviceId,
             userId,
             entityType: 'BATCH',
-            entityId: item.batchId,
+            entityId: batchId,
             operationType: SyncOperationType.UPDATE,
             payload: bObj,
             createdAt: nowIso,

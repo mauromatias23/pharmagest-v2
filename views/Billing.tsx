@@ -5,6 +5,17 @@ import { COMPANY_INFO, VAT_RATE, PAYMENT_METHODS } from '../constants';
 import { db, type DailyClosure, type ShiftBreakdown } from '../services/db';
 import { SyncService } from '../services/syncService';
 import { safeUUID } from '../services/supabaseClient';
+import {
+  roundMoney,
+  summarizeInvoicesByPayment,
+  getAngolaDateKey,
+  getTodayAngolaDateKey,
+  isSameAngolaDay,
+  calculateItemTotals,
+  getCanonicalPaymentLabel,
+  formatAngolaTime,
+  formatAngolaDateTime
+} from '../utils/financeUtils';
 import { 
   Search, Trash2, Banknote, CreditCard, Landmark, Layers, History, X, Plus, Minus, Printer as PrinterIcon, CheckCircle, PlusCircle, FileText, Check, AlertCircle, ShieldCheck, ArrowRight, Lock, RotateCcw, Award, Calendar, Clock, User as UserIcon
 } from 'lucide-react';
@@ -14,7 +25,7 @@ interface BillingProps {
   products: Product[];
   batches: Batch[];
   invoices?: Invoice[];
-  onCompleteSale: (invoice: Invoice) => void;
+  onCompleteSale: (invoice: Invoice) => Promise<void> | void;
   onLogout: () => void;
 }
 
@@ -32,26 +43,8 @@ interface CompletedGeneralClosureWithBreakdown extends DailyClosure {
   shiftBreakdowns: ShiftBreakdown[];
 }
 
-// Função utilitária para verificar com precisão se a data corresponde estritamente ao dia de hoje
-const isDateToday = (dateStr?: string): boolean => {
-  if (!dateStr) return false;
-  try {
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) {
-      const todayISO = new Date().toISOString().split('T')[0];
-      const todayLocal = new Date().toLocaleDateString('en-CA');
-      return dateStr.startsWith(todayISO) || dateStr.startsWith(todayLocal);
-    }
-    const now = new Date();
-    return (
-      d.getFullYear() === now.getFullYear() &&
-      d.getMonth() === now.getMonth() &&
-      d.getDate() === now.getDate()
-    );
-  } catch {
-    return false;
-  }
-};
+// Função utilitária para verificar com precisão se a data corresponde estritamente ao dia de hoje (hora de Angola)
+const isDateToday = (dateStr?: string): boolean => isSameAngolaDay(dateStr);
 
 const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [], onCompleteSale, onLogout }) => {
   const [searchTerm, setSearchTerm] = useState('');
@@ -85,15 +78,14 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
     try {
       await SyncService.performAutoMidnightClosureIfNeeded();
 
-      const todayISO = new Date().toISOString().split('T')[0];
-      const todayLocal = new Date().toLocaleDateString('en-CA');
+      const todayAngola = getTodayAngolaDateKey();
       
       const allInvoices = await db.invoices.toArray();
       const allClosures = await db.dailyClosures.toArray();
 
-      // Fechos de turno realizados hoje
+      // Fechos de turno realizados hoje (calendário de Angola)
       const shiftsToday = allClosures
-        .filter(c => (isDateToday(c.date) || c.date === todayISO || c.date === todayLocal) && c.type === 'SHIFT')
+        .filter(c => (isDateToday(c.date) || getAngolaDateKey(c.date) === todayAngola) && c.type === 'SHIFT')
         .sort((a, b) => (a.shiftNumber || 1) - (b.shiftNumber || 1));
       
       setTodayClosedShifts(shiftsToday);
@@ -127,17 +119,9 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
     return () => clearTimeout(timer);
   }, [successToast]);
 
-  // Estatísticas das vendas ativas do turno corrente
+  // Estatísticas das vendas ativas do turno corrente (inclui todas as variações de Multicaixa/TPA e Dinheiro/Numerário)
   const dailyStats = useMemo(() => {
-    const stats = { cash: 0, tpa: 0, transfer: 0, mixed: 0, total: 0 };
-    dailyInvoices.forEach(inv => {
-      if (inv.paymentMethod === 'Dinheiro') stats.cash += inv.totalNet;
-      else if (inv.paymentMethod === 'Multicaixa (TPA)') stats.tpa += inv.totalNet;
-      else if (inv.paymentMethod === 'Transferência') stats.transfer += inv.totalNet;
-      else if (inv.paymentMethod === 'Misto') stats.mixed += inv.totalNet;
-      stats.total += inv.totalNet;
-    });
-    return stats;
+    return summarizeInvoicesByPayment(dailyInvoices, false);
   }, [dailyInvoices]);
 
   const filteredProducts = useMemo(() => {
@@ -148,9 +132,9 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
   }, [products, searchTerm]);
 
   const cartSummary = useMemo(() => {
-    const gross = cart.reduce((sum, item) => sum + item.subtotal, 0);
-    const vat = cart.reduce((sum, item) => sum + item.vatAmount, 0);
-    return { gross, vat, net: gross + vat };
+    const gross = roundMoney(cart.reduce((sum, item) => sum + (Number(item.subtotal) || 0), 0));
+    const vat = roundMoney(cart.reduce((sum, item) => sum + (Number(item.vatAmount) || 0), 0));
+    return { gross, vat, net: roundMoney(gross + vat) };
   }, [cart]);
 
   const normalizeIso = (d?: string) => {
@@ -164,7 +148,7 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
   };
 
   const addToCart = (product: Product) => {
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getTodayAngolaDateKey();
     const activeBatches = batches
       .filter(b => b.productId === product.id && b.quantity > 0 && normalizeIso(b.expiryDate) >= todayStr)
       .sort((a, b) => normalizeIso(a.expiryDate).localeCompare(normalizeIso(b.expiryDate)));
@@ -196,8 +180,7 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
     if (existing) {
       updateQuantity(existing.id, 1);
     } else {
-      const subtotal = product.sellPrice;
-      const vatAmount = product.hasVAT ? subtotal * VAT_RATE : 0;
+      const { subtotal, vatAmount } = calculateItemTotals(1, product.sellPrice, product.hasVAT !== false, VAT_RATE);
       const newItem: InvoiceItem = {
         id: Math.random().toString(36).substring(2, 11),
         productId: product.id,
@@ -206,8 +189,8 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
         lotNumber: batch.lotNumber,
         quantity: 1,
         unitPrice: product.sellPrice,
-        subtotal: subtotal,
-        vatAmount: vatAmount
+        subtotal,
+        vatAmount
       };
       setCart(prev => [...prev, newItem]);
     }
@@ -223,13 +206,14 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
           alert(`Stock insuficiente! Quantidade máxima disponível neste lote: ${batch.quantity}`);
           return item;
         }
-        const subtotal = newQty * item.unitPrice;
         const product = products.find(p => p.id === item.productId);
+        const hasVAT = product ? product.hasVAT !== false : item.vatAmount > 0;
+        const { subtotal, vatAmount } = calculateItemTotals(newQty, item.unitPrice, hasVAT, VAT_RATE);
         return {
           ...item,
           quantity: newQty,
-          subtotal: subtotal,
-          vatAmount: (product?.hasVAT) ? subtotal * VAT_RATE : 0
+          subtotal,
+          vatAmount
         };
       }
       return item;
@@ -246,7 +230,11 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
     try {
       setIsFinishing(true);
       const date = new Date();
-      const invNumber = `FR-${date.getFullYear()}/${Math.floor(1000 + Math.random() * 8999)}`;
+      const angolaDay = getAngolaDateKey(date);
+      const dayCode = angolaDay.replace(/-/g, '').slice(4); // MMDD
+      const timeCode = `${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}${String(date.getSeconds()).padStart(2, '0')}`;
+      const randSuffix = Math.floor(100 + Math.random() * 900);
+      const invNumber = `FR-${angolaDay.slice(0, 4)}/${dayCode}-${timeCode}-${randSuffix}`;
 
       const newInvoice: Invoice = {
         id: safeUUID(),
@@ -260,20 +248,15 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
         totalVAT: cartSummary.vat,
         totalNet: cartSummary.net,
         status: InvoiceStatus.ISSUED,
-        paymentMethod,
+        paymentMethod: getCanonicalPaymentLabel(paymentMethod),
         items: [...cart],
         closed: false,
         shiftNumber: currentShiftNumber,
         shiftName: currentShiftName
       };
 
-      // Salva a venda imediatamente no banco local e atualiza stock
-      try {
-        await onCompleteSale(newInvoice);
-      } catch (saleErr) {
-        console.warn('[Billing onCompleteSale Warning, fallback local seguro]', saleErr);
-        await db.invoices.put({ ...newInvoice, synchronized: false });
-      }
+      // Salva a venda atomicamente no banco local e atualiza stock
+      await onCompleteSale(newInvoice);
 
       // Adiciona instantaneamente aos registos de vendas ativas
       setDailyInvoices(prev => [...prev.filter(i => i.id !== newInvoice.id), newInvoice].sort((a, b) => a.date.localeCompare(b.date)));
@@ -327,7 +310,7 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
 
     try {
       setIsProcessingClosing(true);
-      const todayStr = new Date().toISOString().split('T')[0];
+      const todayStr = getTodayAngolaDateKey();
       const closureId = `CLS-TURNO-${currentShiftNumber}-${Date.now()}`;
       const timestampStr = new Date().toISOString();
 
@@ -339,12 +322,12 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
         type: 'SHIFT',
         shiftNumber: currentShiftNumber,
         shiftName: currentShiftName,
-        totalCash: dailyStats.cash,
-        totalTpa: dailyStats.tpa,
-        totalTransfer: dailyStats.transfer,
-        totalMixed: dailyStats.mixed,
+        totalCash: roundMoney(dailyStats.cash),
+        totalTpa: roundMoney(dailyStats.tpa),
+        totalTransfer: roundMoney(dailyStats.transfer),
+        totalMixed: roundMoney(dailyStats.mixed),
         totalInvoices: dailyInvoices.length,
-        grandTotal: dailyStats.total,
+        grandTotal: roundMoney(dailyStats.total),
         timestamp: timestampStr,
         synchronized: false
       };
@@ -395,14 +378,14 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
 
     try {
       setIsProcessingClosing(true);
-      const todayStr = new Date().toISOString().split('T')[0];
+      const todayStr = getTodayAngolaDateKey();
       const closureId = `CLS-GERAL-${Date.now()}`;
       const timestampStr = new Date().toISOString();
 
       // 1. Carrega todos os fechos de turno já concluídos hoje
       const allClosures = await db.dailyClosures.toArray();
       const existingShifts = allClosures
-        .filter(c => (isDateToday(c.date) || c.date === todayStr) && c.type === 'SHIFT')
+        .filter(c => (isDateToday(c.date) || getAngolaDateKey(c.date) === todayStr) && c.type === 'SHIFT')
         .sort((a, b) => (a.shiftNumber || 1) - (b.shiftNumber || 1));
 
       const breakdowns: ShiftBreakdown[] = [];
@@ -414,12 +397,12 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
           shiftName: s.shiftName || `${s.shiftNumber || 1}º Turno`,
           userId: s.userId,
           userName: s.userName,
-          totalCash: s.totalCash,
-          totalTpa: s.totalTpa,
-          totalTransfer: s.totalTransfer,
-          totalMixed: s.totalMixed,
+          totalCash: roundMoney(s.totalCash),
+          totalTpa: roundMoney(s.totalTpa),
+          totalTransfer: roundMoney(s.totalTransfer),
+          totalMixed: roundMoney(s.totalMixed),
           totalInvoices: s.totalInvoices,
-          grandTotal: s.grandTotal,
+          grandTotal: roundMoney(s.grandTotal),
           closedAt: s.timestamp
         });
       }
@@ -432,12 +415,12 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
           shiftName: currentShiftName,
           userId: user.id,
           userName: user.name,
-          totalCash: dailyStats.cash,
-          totalTpa: dailyStats.tpa,
-          totalTransfer: dailyStats.transfer,
-          totalMixed: dailyStats.mixed,
+          totalCash: roundMoney(dailyStats.cash),
+          totalTpa: roundMoney(dailyStats.tpa),
+          totalTransfer: roundMoney(dailyStats.transfer),
+          totalMixed: roundMoney(dailyStats.mixed),
           totalInvoices: dailyInvoices.length,
-          grandTotal: dailyStats.total,
+          grandTotal: roundMoney(dailyStats.total),
           closedAt: timestampStr
         };
         breakdowns.push(activeShiftBreakdown);
@@ -464,12 +447,12 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
       }
 
       // 2. Calcula os Totais Globais do Dia (Fecho Total)
-      const grandTotalCash = breakdowns.reduce((sum, b) => sum + b.totalCash, 0);
-      const grandTotalTpa = breakdowns.reduce((sum, b) => sum + b.totalTpa, 0);
-      const grandTotalTransfer = breakdowns.reduce((sum, b) => sum + b.totalTransfer, 0);
-      const grandTotalMixed = breakdowns.reduce((sum, b) => sum + b.totalMixed, 0);
+      const grandTotalCash = roundMoney(breakdowns.reduce((sum, b) => sum + b.totalCash, 0));
+      const grandTotalTpa = roundMoney(breakdowns.reduce((sum, b) => sum + b.totalTpa, 0));
+      const grandTotalTransfer = roundMoney(breakdowns.reduce((sum, b) => sum + b.totalTransfer, 0));
+      const grandTotalMixed = roundMoney(breakdowns.reduce((sum, b) => sum + b.totalMixed, 0));
       const grandTotalInvoices = breakdowns.reduce((sum, b) => sum + b.totalInvoices, 0);
-      const grandTotalAll = breakdowns.reduce((sum, b) => sum + b.grandTotal, 0);
+      const grandTotalAll = roundMoney(grandTotalCash + grandTotalTpa + grandTotalTransfer + grandTotalMixed);
 
       const generalClosureData: DailyClosure = {
         id: closureId,
@@ -1473,7 +1456,7 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
                           <td className="py-1 font-bold text-slate-800 max-w-[140px] truncate">{item.productName}</td>
                           <td className="py-1 text-center font-bold text-slate-600">{item.quantity}</td>
                           <td className="py-1 text-right font-medium text-slate-500">{item.unitPrice.toLocaleString()}</td>
-                          <td className="py-1 text-right font-bold text-slate-800">{(item.quantity * item.unitPrice).toLocaleString()}</td>
+                          <td className="py-1 text-right font-bold text-slate-800">{roundMoney((item.subtotal || 0) + (item.vatAmount || 0)).toLocaleString()}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1601,7 +1584,7 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
                           <p className="text-sm font-black text-emerald-600">{inv.totalNet.toLocaleString()} Kz</p>
                         </td>
                         <td className="px-6 py-4 text-slate-400 text-[11px] font-bold uppercase">
-                          {new Date(inv.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                          {formatAngolaTime(inv.date, true)}
                         </td>
                         <td className="px-6 py-4 text-center">
                           <button
@@ -1693,7 +1676,7 @@ const Billing: React.FC<BillingProps> = ({ user, products, batches, invoices = [
                   <td className="py-1 font-medium">{item.productName}</td>
                   <td className="py-1 text-center">{item.quantity}</td>
                   <td className="py-1 text-right">{item.unitPrice.toLocaleString()}</td>
-                  <td className="py-1 text-right font-bold">{(item.quantity * item.unitPrice).toLocaleString()}</td>
+                  <td className="py-1 text-right font-bold">{roundMoney((item.subtotal || 0) + (item.vatAmount || 0)).toLocaleString()}</td>
                 </tr>
               ))}
             </tbody>

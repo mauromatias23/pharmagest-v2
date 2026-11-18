@@ -6,6 +6,7 @@ import { safeUUID } from '../services/supabaseClient';
 import { db } from '../services/db';
 import { DeviceService } from '../services/deviceService';
 import { SyncService } from '../services/syncService';
+import { getTodayAngolaDateKey } from '../utils/financeUtils';
 
 interface InventoryProps {
   user: User;
@@ -17,6 +18,7 @@ interface InventoryProps {
   onUpdateProduct: (product: Product) => void;
   onAddProduct: (product: Product, initialBatch?: { lotNumber: string; expiryDate: string; quantity: number }) => void;
   onDeleteProduct?: (productId: string) => void;
+  onRefreshData?: () => Promise<void> | void;
 }
 
 /**
@@ -39,7 +41,7 @@ const normalizeIsoDate = (dStr?: string): string => {
 };
 
 const Inventory: React.FC<InventoryProps> = ({ 
-  user, products, batches, onAddBatch, onUpdateBatch, onDeleteBatch, onUpdateProduct, onAddProduct, onDeleteProduct
+  user, products, batches, onAddBatch, onUpdateBatch, onDeleteBatch, onUpdateProduct, onAddProduct, onDeleteProduct, onRefreshData
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const isAdmin = user.role === UserRole.ADMIN;
@@ -62,13 +64,13 @@ const Inventory: React.FC<InventoryProps> = ({
   const [stockProduct, setStockProduct] = useState<Product | null>(null);
   const [newPhysicalQty, setNewPhysicalQty] = useState<string>('');
   const [stockAdjustmentReason, setStockAdjustmentReason] = useState<string>('Inventário Físico / Acerto de Contagem de Balcão');
-  const [stockToast, setStockToast] = useState<string | null>(null);
+  const [stockToast, setStockToast] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [isSavingStock, setIsSavingStock] = useState<boolean>(false);
   const [isPushingCloud, setIsPushingCloud] = useState<boolean>(false);
 
-  const showFeedback = (msg: string) => {
-    setStockToast(msg);
-    setTimeout(() => setStockToast(null), 4000);
+  const showFeedback = (msg: string, type: 'success' | 'error' = 'success') => {
+    setStockToast({ text: msg, type });
+    setTimeout(() => setStockToast(null), 5000);
   };
 
   const handlePushStockToSupabase = async () => {
@@ -76,12 +78,12 @@ const Inventory: React.FC<InventoryProps> = ({
     try {
       const res = await SyncService.pushAllLocalToSupabase();
       if (res.success) {
-        showFeedback(res.message);
+        showFeedback(res.message, 'success');
       } else {
-        alert(res.message || 'Falha ao atualizar dados no Supabase.');
+        showFeedback(res.message || 'Falha ao atualizar dados no Supabase.', 'error');
       }
     } catch (err: any) {
-      alert(`Erro ao sincronizar com Supabase: ${err?.message || err}`);
+      showFeedback(`Erro ao sincronizar com Supabase: ${err?.message || err}`, 'error');
     } finally {
       setIsPushingCloud(false);
     }
@@ -276,7 +278,6 @@ const Inventory: React.FC<InventoryProps> = ({
             quantity: newTargetBatchQty
           };
           await SyncService.updateBatch(updatedBatch);
-          onUpdateBatch(updatedBatch);
         } else {
           // A quantidade pretendida é menor que a soma dos outros lotes:
           // Coloca targetQty integralmente no targetBatch e zera os outros lotes
@@ -286,7 +287,6 @@ const Inventory: React.FC<InventoryProps> = ({
             quantity: targetQty
           };
           await SyncService.updateBatch(updatedBatch);
-          onUpdateBatch(updatedBatch);
 
           for (const otherB of prodBatches.filter(b => b.id !== targetBatch.id)) {
             if ((Number(otherB.quantity) || 0) > 0) {
@@ -295,7 +295,6 @@ const Inventory: React.FC<InventoryProps> = ({
                 quantity: 0
               };
               await SyncService.updateBatch(zeroedB);
-              onUpdateBatch(zeroedB);
             }
           }
         }
@@ -307,11 +306,10 @@ const Inventory: React.FC<InventoryProps> = ({
           lotNumber: 'LOTE-REAL',
           quantity: targetQty,
           expiryDate: new Date(Date.now() + 63072000000).toISOString().split('T')[0], // 2 anos de validade padrão
-          entryDate: new Date().toISOString().split('T')[0]
+          entryDate: getTodayAngolaDateKey()
         };
 
         await SyncService.createBatch(newBatch);
-        onAddBatch(newBatch);
       }
 
       // 2. Atualizar o registo do produto
@@ -320,7 +318,6 @@ const Inventory: React.FC<InventoryProps> = ({
         totalQuantity: targetQty
       };
       await SyncService.updateProduct(updatedProduct);
-      onUpdateProduct(updatedProduct);
 
       // 3. Registar o movimento de stock para auditoria
       const movement: StockMovement = {
@@ -340,6 +337,10 @@ const Inventory: React.FC<InventoryProps> = ({
       };
       await db.stockMovements.put(movement);
 
+      if (onRefreshData) {
+        await onRefreshData();
+      }
+
       showFeedback(`Stock de "${stockProduct.name}" corrigido com sucesso para ${targetQty} unidades!`);
       setShowStockModal(false);
     } catch (err: any) {
@@ -356,14 +357,20 @@ const Inventory: React.FC<InventoryProps> = ({
     p.activeIngredient.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = getTodayAngolaDateKey();
 
   return (
     <div className="space-y-6">
       {stockToast && (
-        <div className="fixed bottom-6 right-6 z-50 bg-emerald-700 text-white px-5 py-3 rounded-2xl shadow-2xl flex items-center gap-3 animate-in fade-in slide-in-from-bottom-3 font-bold text-sm">
-          <CheckCircle2 className="w-5 h-5 text-emerald-300" />
-          <span>{stockToast}</span>
+        <div className={`fixed bottom-6 right-6 z-50 px-5 py-3 rounded-2xl shadow-2xl flex items-center gap-3 animate-in fade-in slide-in-from-bottom-3 font-bold text-sm text-white ${
+          stockToast.type === 'error' ? 'bg-rose-700' : 'bg-emerald-700'
+        }`}>
+          {stockToast.type === 'error' ? (
+            <AlertTriangle className="w-5 h-5 text-rose-200 shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-5 h-5 text-emerald-300 shrink-0" />
+          )}
+          <span>{stockToast.text}</span>
         </div>
       )}
 

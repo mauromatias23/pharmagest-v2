@@ -15,6 +15,7 @@ import {
   DollarSign
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+import { getTodayAngolaDateKey, isSameAngolaDay, roundMoney, formatAngolaTime } from '../utils/financeUtils';
 
 interface DashboardProps {
   products: Product[];
@@ -37,8 +38,8 @@ const Dashboard: React.FC<DashboardProps> = ({ products, batches, invoices }) =>
     return Math.max(0, Number(product.totalQuantity) || 0);
   };
 
-  // 2. Datas de referência
-  const today = new Date().toISOString().split('T')[0];
+  // 2. Datas de referência (Calendário de Angola)
+  const today = getTodayAngolaDateKey();
   
   // Limiar de 60 Dias (2 meses)
   const twoMonthsDate = new Date();
@@ -51,9 +52,11 @@ const Dashboard: React.FC<DashboardProps> = ({ products, batches, invoices }) =>
   const sixMonthsThreshold = sixMonthsDate.toISOString().split('T')[0];
 
   // 3. Indicadores Operacionais e Financeiros
-  const dailySales = invoices
-    .filter(inv => inv.date.startsWith(today) && inv.status === InvoiceStatus.ISSUED)
-    .reduce((sum, inv) => sum + inv.totalNet, 0);
+  const dailySales = roundMoney(
+    invoices
+      .filter(inv => isSameAngolaDay(inv.date, today) && inv.status === InvoiceStatus.ISSUED)
+      .reduce((sum, inv) => sum + (Number(inv.totalNet) || 0), 0)
+  );
 
   // Produtos em stock crítico (Stock real <= Stock mínimo)
   const criticalProductsList = products.filter(p => getProductRealStock(p) <= p.minStock);
@@ -97,7 +100,7 @@ const Dashboard: React.FC<DashboardProps> = ({ products, batches, invoices }) =>
   // Dados dinâmicos do modal selecionado
   const getModalData = () => {
     if (activeModal === 'sales') {
-      const sales = invoices.filter(inv => inv.date.startsWith(today));
+      const sales = invoices.filter(inv => isSameAngolaDay(inv.date, today));
       return {
         title: 'Vendas de Hoje',
         description: `Todas as faturas emitidas hoje (${new Date().toLocaleDateString('pt-AO')}).`,
@@ -397,7 +400,7 @@ const Dashboard: React.FC<DashboardProps> = ({ products, batches, invoices }) =>
                               <td className="px-4 py-3.5 font-mono font-black text-slate-900">{inv.invoiceNumber}</td>
                               <td className="px-4 py-3.5 font-semibold text-slate-700">{inv.customerName || 'Consumidor Final'}</td>
                               <td className="px-4 py-3.5 text-slate-500">
-                                {inv.date.includes('T') ? inv.date.split('T')[1].substring(0, 5) : 'N/D'}
+                                {formatAngolaTime(inv.date)}
                               </td>
                               <td className="px-4 py-3.5 text-right font-black text-slate-900">
                                 {inv.totalNet.toLocaleString()} Kz
@@ -428,19 +431,21 @@ const Dashboard: React.FC<DashboardProps> = ({ products, batches, invoices }) =>
                     <div className="p-4 bg-emerald-50/50 border border-emerald-100 rounded-xl">
                       <p className="text-xs text-emerald-700 font-bold uppercase tracking-wider">Faturado Hoje (Líquido)</p>
                       <p className="text-xl font-black text-emerald-900 mt-1">
-                        {(modalData.items as Invoice[])
-                          .filter(inv => inv.status === InvoiceStatus.ISSUED)
-                          .reduce((sum, inv) => sum + inv.totalNet, 0)
-                          .toLocaleString()} Kz
+                        {roundMoney(
+                          (modalData.items as Invoice[])
+                            .filter(inv => inv.status === InvoiceStatus.ISSUED)
+                            .reduce((sum, inv) => sum + (Number(inv.totalNet) || 0), 0)
+                        ).toLocaleString()} Kz
                       </p>
                     </div>
                     <div className="p-4 bg-slate-50 border rounded-xl">
                       <p className="text-xs text-slate-500 font-bold uppercase tracking-wider">IVA Cobrado Hoje</p>
                       <p className="text-xl font-black text-slate-800 mt-1">
-                        {(modalData.items as Invoice[])
-                          .filter(inv => inv.status === InvoiceStatus.ISSUED)
-                          .reduce((sum, inv) => sum + inv.totalVAT, 0)
-                          .toLocaleString()} Kz
+                        {roundMoney(
+                          (modalData.items as Invoice[])
+                            .filter(inv => inv.status === InvoiceStatus.ISSUED)
+                            .reduce((sum, inv) => sum + (Number(inv.totalVAT) || 0), 0)
+                        ).toLocaleString()} Kz
                       </p>
                     </div>
                     <div className="p-4 bg-red-50/50 border border-red-100 rounded-xl">

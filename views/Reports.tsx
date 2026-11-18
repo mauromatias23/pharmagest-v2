@@ -26,6 +26,16 @@ import {
 import { FrequentProductsReport } from '../components/reports/FrequentProductsReport';
 import { ExpensesReport } from '../components/reports/ExpensesReport';
 import { FinancialFlowReport } from '../components/reports/FinancialFlowReport';
+import {
+  roundMoney,
+  getAngolaDateKey,
+  getTodayAngolaDateKey,
+  getAngolaMonthKey,
+  getAngolaYear,
+  getCanonicalPaymentLabel,
+  formatAngolaTime,
+  formatAngolaDateTime
+} from '../utils/financeUtils';
 
 interface ReportsProps {
   user: User;
@@ -99,9 +109,9 @@ const Reports: React.FC<ReportsProps> = ({
   const [productPeriod, setProductPeriod] = useState<ProductPeriod>('MES');
   const [stockSubTab, setStockSubTab] = useState<'ALL' | 'ALTERED'>('ALL');
   const [selectedIndividualProduct, setSelectedIndividualProduct] = useState<Product | null>(null);
-  const [selectedDailySalesDetail, setSelectedDailySalesDetail] = useState<{ date: string; invoices: Invoice[] } | null>(null);
-  const [selectedMonthlySalesDetail, setSelectedMonthlySalesDetail] = useState<{ month: string; invoices: Invoice[] } | null>(null);
-  const [selectedYearlySalesDetail, setSelectedYearlySalesDetail] = useState<{ year: string; invoices: Invoice[] } | null>(null);
+  const [selectedDailyDate, setSelectedDailyDate] = useState<string | null>(null);
+  const [selectedMonthlyMonth, setSelectedMonthlyMonth] = useState<string | null>(null);
+  const [selectedYearlyYear, setSelectedYearlyYear] = useState<string | null>(null);
 
   // Custom cancellation modal states to avoid window.confirm
   const [invoiceToCancel, setInvoiceToCancel] = useState<Invoice | null>(null);
@@ -114,18 +124,7 @@ const Reports: React.FC<ReportsProps> = ({
   } | null>(null);
 
   // STATE FOR YEAR FILTERING (ANGOLA TIME ZONE CURRENT YEAR DEFAULT)
-  const [selectedYear, setSelectedYear] = useState<number>(() => {
-    const now = new Date();
-    try {
-      const formatter = new Intl.DateTimeFormat('pt-AO', {
-        timeZone: 'Africa/Luanda',
-        year: 'numeric'
-      });
-      return parseInt(formatter.format(now), 10);
-    } catch (e) {
-      return now.getFullYear();
-    }
-  });
+  const [selectedYear, setSelectedYear] = useState<number>(() => getAngolaYear(new Date()));
 
   // State options for product periods
   const [selectedWeekMonth, setSelectedWeekMonth] = useState<number>(() => new Date().getMonth() + 1);
@@ -139,12 +138,12 @@ const Reports: React.FC<ReportsProps> = ({
     const yearsSet = new Set<number>();
     yearsSet.add(2026); // Default active fiscal year
     invoices.forEach(inv => {
-      const y = new Date(inv.date).getFullYear();
+      const y = getAngolaYear(inv.date);
       if (!isNaN(y)) {
         yearsSet.add(y);
       }
     });
-    const currentYear = new Date().getFullYear();
+    const currentYear = getAngolaYear(new Date());
     yearsSet.add(currentYear);
     yearsSet.add(currentYear - 1);
     yearsSet.add(currentYear + 1);
@@ -154,7 +153,7 @@ const Reports: React.FC<ReportsProps> = ({
   // BASE INVOICES FILTERED BY ACTIVE SELECTED YEAR (Continuous data storage support)
   const yearFilteredInvoices = useMemo(() => {
     return invoices.filter(inv => {
-      const invYear = new Date(inv.date).getFullYear();
+      const invYear = getAngolaYear(inv.date);
       return invYear === selectedYear;
     });
   }, [invoices, selectedYear]);
@@ -272,21 +271,22 @@ const Reports: React.FC<ReportsProps> = ({
     return items;
   }, [filteredInvoices]);
 
-  // SALES REPORT GROUPING
+  // SALES REPORT GROUPING (Fuso Angola + Valores Canónicos Arredondados)
   // 1. Daily Sales
   const dailySales = useMemo(() => {
     const groups: { [key: string]: { date: string; count: number; gross: number; vat: number; net: number; invoices: Invoice[] } } = {};
     yearFilteredInvoices.forEach(inv => {
-      const day = inv.date.split('T')[0];
+      const day = getAngolaDateKey(inv.date);
+      if (!day) return;
       if (!groups[day]) {
         groups[day] = { date: day, count: 0, gross: 0, vat: 0, net: 0, invoices: [] };
       }
       groups[day].invoices.push(inv);
       if (inv.status === InvoiceStatus.ISSUED) {
         groups[day].count++;
-        groups[day].gross += inv.totalGross;
-        groups[day].vat += inv.totalVAT;
-        groups[day].net += inv.totalNet;
+        groups[day].gross = roundMoney(groups[day].gross + (Number(inv.totalGross) || 0));
+        groups[day].vat = roundMoney(groups[day].vat + (Number(inv.totalVAT) || 0));
+        groups[day].net = roundMoney(groups[day].net + (Number(inv.totalNet) || 0));
       }
     });
     return Object.values(groups).sort((a, b) => b.date.localeCompare(a.date));
@@ -296,16 +296,17 @@ const Reports: React.FC<ReportsProps> = ({
   const monthlySales = useMemo(() => {
     const groups: { [key: string]: { month: string; count: number; gross: number; vat: number; net: number; invoices: Invoice[] } } = {};
     yearFilteredInvoices.forEach(inv => {
-      const month = inv.date.substring(0, 7); // YYYY-MM
+      const month = getAngolaMonthKey(inv.date); // YYYY-MM
+      if (!month) return;
       if (!groups[month]) {
         groups[month] = { month, count: 0, gross: 0, vat: 0, net: 0, invoices: [] };
       }
       groups[month].invoices.push(inv);
       if (inv.status === InvoiceStatus.ISSUED) {
         groups[month].count++;
-        groups[month].gross += inv.totalGross;
-        groups[month].vat += inv.totalVAT;
-        groups[month].net += inv.totalNet;
+        groups[month].gross = roundMoney(groups[month].gross + (Number(inv.totalGross) || 0));
+        groups[month].vat = roundMoney(groups[month].vat + (Number(inv.totalVAT) || 0));
+        groups[month].net = roundMoney(groups[month].net + (Number(inv.totalNet) || 0));
       }
     });
     return Object.values(groups).sort((a, b) => b.month.localeCompare(a.month));
@@ -315,29 +316,43 @@ const Reports: React.FC<ReportsProps> = ({
   const yearlySales = useMemo(() => {
     const groups: { [key: string]: { year: string; count: number; gross: number; vat: number; net: number; invoices: Invoice[] } } = {};
     yearFilteredInvoices.forEach(inv => {
-      const year = inv.date.substring(0, 4); // YYYY
+      const year = String(getAngolaYear(inv.date)); // YYYY
       if (!groups[year]) {
         groups[year] = { year, count: 0, gross: 0, vat: 0, net: 0, invoices: [] };
       }
       groups[year].invoices.push(inv);
       if (inv.status === InvoiceStatus.ISSUED) {
         groups[year].count++;
-        groups[year].gross += inv.totalGross;
-        groups[year].vat += inv.totalVAT;
-        groups[year].net += inv.totalNet;
+        groups[year].gross = roundMoney(groups[year].gross + (Number(inv.totalGross) || 0));
+        groups[year].vat = roundMoney(groups[year].vat + (Number(inv.totalVAT) || 0));
+        groups[year].net = roundMoney(groups[year].net + (Number(inv.totalNet) || 0));
       }
     });
     return Object.values(groups).sort((a, b) => b.year.localeCompare(a.year));
   }, [yearFilteredInvoices]);
 
+  // Detalhes derivados dinamicamente a partir dos dados vivos (sem snapshots desatualizados)
+  const selectedDailySalesDetail = useMemo(
+    () => (selectedDailyDate ? dailySales.find(d => d.date === selectedDailyDate) || null : null),
+    [selectedDailyDate, dailySales]
+  );
+
+  const selectedMonthlySalesDetail = useMemo(
+    () => (selectedMonthlyMonth ? monthlySales.find(m => m.month === selectedMonthlyMonth) || null : null),
+    [selectedMonthlyMonth, monthlySales]
+  );
+
+  const selectedYearlySalesDetail = useMemo(
+    () => (selectedYearlyYear ? yearlySales.find(y => y.year === selectedYearlyYear) || null : null),
+    [selectedYearlyYear, yearlySales]
+  );
+
   // INVOICES IN SELECTED DATE RANGE FOR PERMANENT BULK DELETION
   const rangeMatchingInvoices = useMemo(() => {
     if (!rangeStartDate || !rangeEndDate) return [];
-    const start = rangeStartDate + 'T00:00:00';
-    const end = rangeEndDate + 'T23:59:59';
     return invoices.filter(inv => {
-      const d = inv.date;
-      return d >= start && d <= end;
+      const d = getAngolaDateKey(inv.date);
+      return d >= rangeStartDate && d <= rangeEndDate;
     });
   }, [invoices, rangeStartDate, rangeEndDate]);
 
@@ -381,7 +396,7 @@ const Reports: React.FC<ReportsProps> = ({
 
   // Combined stock reports data: contains totalEntryStock, activeStock, and soldQty
   const stockReportsCombined = useMemo(() => {
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getTodayAngolaDateKey();
     return products.map(prod => {
       const pBatches = batchesByProduct[prod.id] || [];
       const validBatches = pBatches.filter(b => b.expiryDate >= todayStr);
@@ -431,9 +446,13 @@ const Reports: React.FC<ReportsProps> = ({
       salesCounts[p.id] = 0;
     });
 
+    const rangeStartDay = activeProductRange.startDate.slice(0, 10);
+    const rangeEndDay = activeProductRange.endDate.slice(0, 10);
+
     yearFilteredInvoices.forEach(inv => {
       if (inv.status === InvoiceStatus.ISSUED) {
-        if (inv.date >= activeProductRange.startDate && inv.date <= activeProductRange.endDate) {
+        const invDay = getAngolaDateKey(inv.date);
+        if (invDay >= rangeStartDay && invDay <= rangeEndDay) {
           inv.items.forEach(item => {
             if (salesCounts[item.productId] !== undefined) {
               salesCounts[item.productId] += item.quantity;
@@ -504,7 +523,8 @@ const Reports: React.FC<ReportsProps> = ({
     
     selectedDailySalesDetail.invoices.forEach(inv => {
       if (inv.status !== InvoiceStatus.ISSUED) return;
-      const hour = new Date(inv.date).toLocaleTimeString('pt-AO', { hour: '2-digit', minute: '2-digit' });
+      const hour = formatAngolaTime(inv.date);
+      const canonicalMethod = getCanonicalPaymentLabel(inv.paymentMethod);
       inv.items.forEach(item => {
         const prod = products.find(p => p.id === item.productId);
         items.push({
@@ -512,8 +532,8 @@ const Reports: React.FC<ReportsProps> = ({
           productCode: prod ? prod.code : '',
           quantity: item.quantity,
           unitPrice: item.unitPrice,
-          paymentMethod: inv.paymentMethod,
-          totalLine: item.subtotal + item.vatAmount,
+          paymentMethod: canonicalMethod,
+          totalLine: roundMoney((Number(item.subtotal) || 0) + (Number(item.vatAmount) || 0)),
           hour
         });
       });
@@ -526,16 +546,19 @@ const Reports: React.FC<ReportsProps> = ({
     const totals: { [method: string]: number } = {};
     selectedDailySalesDetail.invoices.forEach(inv => {
       if (inv.status !== InvoiceStatus.ISSUED) return;
-      totals[inv.paymentMethod] = (totals[inv.paymentMethod] || 0) + inv.totalNet;
+      const canonicalMethod = getCanonicalPaymentLabel(inv.paymentMethod);
+      totals[canonicalMethod] = roundMoney((totals[canonicalMethod] || 0) + (Number(inv.totalNet) || 0));
     });
     return totals;
   }, [selectedDailySalesDetail]);
 
   const dailyTotalNet = useMemo(() => {
     if (!selectedDailySalesDetail) return 0;
-    return selectedDailySalesDetail.invoices
-      .filter(inv => inv.status === InvoiceStatus.ISSUED)
-      .reduce((sum, inv) => sum + inv.totalNet, 0);
+    return roundMoney(
+      selectedDailySalesDetail.invoices
+        .filter(inv => inv.status === InvoiceStatus.ISSUED)
+        .reduce((sum, inv) => sum + (Number(inv.totalNet) || 0), 0)
+    );
   }, [selectedDailySalesDetail]);
 
   const monthlyDaysList = useMemo(() => {
@@ -552,7 +575,8 @@ const Reports: React.FC<ReportsProps> = ({
     
     selectedMonthlySalesDetail.invoices.forEach(inv => {
       if (inv.status !== InvoiceStatus.ISSUED) return;
-      const day = inv.date.split('T')[0];
+      const day = getAngolaDateKey(inv.date);
+      if (!day) return;
       if (!groups[day]) {
         groups[day] = {
           date: day,
@@ -562,9 +586,11 @@ const Reports: React.FC<ReportsProps> = ({
           paymentTotals: {}
         };
       }
+      const canonicalMethod = getCanonicalPaymentLabel(inv.paymentMethod);
+      const net = Number(inv.totalNet) || 0;
       groups[day].invoiceCount++;
-      groups[day].totalNet += inv.totalNet;
-      groups[day].paymentTotals[inv.paymentMethod] = (groups[day].paymentTotals[inv.paymentMethod] || 0) + inv.totalNet;
+      groups[day].totalNet = roundMoney(groups[day].totalNet + net);
+      groups[day].paymentTotals[canonicalMethod] = roundMoney((groups[day].paymentTotals[canonicalMethod] || 0) + net);
       
       inv.items.forEach(item => {
         groups[day].productCount += item.quantity;
@@ -576,9 +602,11 @@ const Reports: React.FC<ReportsProps> = ({
 
   const monthlyTotalNet = useMemo(() => {
     if (!selectedMonthlySalesDetail) return 0;
-    return selectedMonthlySalesDetail.invoices
-      .filter(inv => inv.status === InvoiceStatus.ISSUED)
-      .reduce((sum, inv) => sum + inv.totalNet, 0);
+    return roundMoney(
+      selectedMonthlySalesDetail.invoices
+        .filter(inv => inv.status === InvoiceStatus.ISSUED)
+        .reduce((sum, inv) => sum + (Number(inv.totalNet) || 0), 0)
+    );
   }, [selectedMonthlySalesDetail]);
 
   const yearlyMonthsList = useMemo(() => {
@@ -595,7 +623,8 @@ const Reports: React.FC<ReportsProps> = ({
     
     selectedYearlySalesDetail.invoices.forEach(inv => {
       if (inv.status !== InvoiceStatus.ISSUED) return;
-      const month = inv.date.substring(0, 7); // YYYY-MM
+      const month = getAngolaMonthKey(inv.date); // YYYY-MM
+      if (!month) return;
       if (!groups[month]) {
         groups[month] = {
           month,
@@ -605,9 +634,11 @@ const Reports: React.FC<ReportsProps> = ({
           paymentTotals: {}
         };
       }
+      const canonicalMethod = getCanonicalPaymentLabel(inv.paymentMethod);
+      const net = Number(inv.totalNet) || 0;
       groups[month].invoiceCount++;
-      groups[month].totalNet += inv.totalNet;
-      groups[month].paymentTotals[inv.paymentMethod] = (groups[month].paymentTotals[inv.paymentMethod] || 0) + inv.totalNet;
+      groups[month].totalNet = roundMoney(groups[month].totalNet + net);
+      groups[month].paymentTotals[canonicalMethod] = roundMoney((groups[month].paymentTotals[canonicalMethod] || 0) + net);
       
       inv.items.forEach(item => {
         groups[month].productCount += item.quantity;
@@ -619,9 +650,11 @@ const Reports: React.FC<ReportsProps> = ({
 
   const yearlyTotalNet = useMemo(() => {
     if (!selectedYearlySalesDetail) return 0;
-    return selectedYearlySalesDetail.invoices
-      .filter(inv => inv.status === InvoiceStatus.ISSUED)
-      .reduce((sum, inv) => sum + inv.totalNet, 0);
+    return roundMoney(
+      selectedYearlySalesDetail.invoices
+        .filter(inv => inv.status === InvoiceStatus.ISSUED)
+        .reduce((sum, inv) => sum + (Number(inv.totalNet) || 0), 0)
+    );
   }, [selectedYearlySalesDetail]);
 
 
@@ -672,8 +705,8 @@ const Reports: React.FC<ReportsProps> = ({
   };
 
   // General statistics
-  const totalIVA = filteredInvoices.filter(inv => inv.status === InvoiceStatus.ISSUED).reduce((sum, inv) => sum + inv.totalVAT, 0);
-  const totalGeral = filteredInvoices.filter(inv => inv.status === InvoiceStatus.ISSUED).reduce((sum, inv) => sum + inv.totalNet, 0);
+  const totalIVA = roundMoney(filteredInvoices.filter(inv => inv.status === InvoiceStatus.ISSUED).reduce((sum, inv) => sum + (Number(inv.totalVAT) || 0), 0));
+  const totalGeral = roundMoney(filteredInvoices.filter(inv => inv.status === InvoiceStatus.ISSUED).reduce((sum, inv) => sum + (Number(inv.totalNet) || 0), 0));
 
   return (
     <div className="space-y-6">
@@ -1011,8 +1044,8 @@ const Reports: React.FC<ReportsProps> = ({
                             </td>
                           )}
                           <td className="px-5 py-3.5">
-                            <p className="font-bold text-slate-700">{new Date(inv.date).toLocaleDateString('pt-AO')}</p>
-                            <p className="text-[10px] text-slate-400">{new Date(inv.date).toLocaleTimeString('pt-AO').substring(0, 5)}</p>
+                            <p className="font-bold text-slate-700">{new Date(inv.date).toLocaleDateString('pt-AO', { timeZone: 'Africa/Luanda' })}</p>
+                            <p className="text-[10px] text-slate-400">{formatAngolaTime(inv.date)}</p>
                           </td>
                           <td className="px-5 py-3.5 font-mono font-bold text-slate-900">
                             {inv.invoiceNumber}
@@ -1132,7 +1165,7 @@ const Reports: React.FC<ReportsProps> = ({
                           <td className="px-5 py-3.5 text-center font-black text-slate-900">{item.quantity}</td>
                           <td className="px-5 py-3.5 text-right text-slate-500">{item.unitPrice.toLocaleString()} Kz</td>
                           <td className="px-5 py-3.5 text-right text-emerald-600 font-bold">{(item.vatAmount).toLocaleString()} Kz</td>
-                          <td className="px-5 py-3.5 text-right font-black text-slate-900">{(item.subtotal + item.vatAmount).toLocaleString()} Kz</td>
+                          <td className="px-5 py-3.5 text-right font-black text-slate-900">{roundMoney((item.subtotal || 0) + (item.vatAmount || 0)).toLocaleString()} Kz</td>
                           <td className="px-5 py-3.5 text-center">
                             {item.invoiceStatus === InvoiceStatus.ISSUED ? (
                               user.role === UserRole.ADMIN ? (
@@ -1237,7 +1270,7 @@ const Reports: React.FC<ReportsProps> = ({
                           dailySales.map(day => (
                             <tr 
                               key={day.date} 
-                              onDoubleClick={() => setSelectedDailySalesDetail(day)}
+                              onDoubleClick={() => setSelectedDailyDate(day.date)}
                               className="hover:bg-slate-50/60 transition-colors cursor-pointer select-none"
                               title="Duplo clique para abrir o relatório detalhado deste dia"
                             >
@@ -1292,7 +1325,7 @@ const Reports: React.FC<ReportsProps> = ({
                           monthlySales.map(m => (
                             <tr 
                               key={m.month} 
-                              onDoubleClick={() => setSelectedMonthlySalesDetail(m)}
+                              onDoubleClick={() => setSelectedMonthlyMonth(m.month)}
                               className="hover:bg-slate-50/60 transition-colors cursor-pointer select-none"
                               title="Duplo clique para abrir o relatório detalhado deste mês"
                             >
@@ -1347,7 +1380,7 @@ const Reports: React.FC<ReportsProps> = ({
                           yearlySales.map(y => (
                             <tr 
                               key={y.year} 
-                              onDoubleClick={() => setSelectedYearlySalesDetail(y)}
+                              onDoubleClick={() => setSelectedYearlyYear(y.year)}
                               className="hover:bg-slate-50/60 transition-colors cursor-pointer select-none"
                               title="Duplo clique para abrir o relatório detalhado deste ano"
                             >
@@ -2050,7 +2083,7 @@ const Reports: React.FC<ReportsProps> = ({
                 </p>
               </div>
               <button 
-                onClick={() => setSelectedDailySalesDetail(null)} 
+                onClick={() => setSelectedDailyDate(null)} 
                 className="p-1.5 hover:bg-slate-800 rounded-full transition-colors text-slate-400 hover:text-white"
               >
                 <X className="w-5 h-5" />
@@ -2155,7 +2188,7 @@ const Reports: React.FC<ReportsProps> = ({
                 <PrinterIcon className="w-4 h-4" /> Baixar / Imprimir PDF (A4)
               </button>
               <button 
-                onClick={() => setSelectedDailySalesDetail(null)}
+                onClick={() => setSelectedDailyDate(null)}
                 className="flex-1 py-3 bg-white border border-slate-200 rounded-xl font-bold uppercase text-xs text-slate-500 tracking-widest hover:bg-slate-100 transition-all"
               >
                 Fechar
@@ -2183,7 +2216,7 @@ const Reports: React.FC<ReportsProps> = ({
                 </p>
               </div>
               <button 
-                onClick={() => setSelectedMonthlySalesDetail(null)} 
+                onClick={() => setSelectedMonthlyMonth(null)} 
                 className="p-1.5 hover:bg-slate-800 rounded-full transition-colors text-slate-400 hover:text-white"
               >
                 <X className="w-5 h-5" />
@@ -2265,7 +2298,7 @@ const Reports: React.FC<ReportsProps> = ({
                 <PrinterIcon className="w-4 h-4" /> Baixar / Imprimir PDF (A4)
               </button>
               <button 
-                onClick={() => setSelectedMonthlySalesDetail(null)}
+                onClick={() => setSelectedMonthlyMonth(null)}
                 className="flex-1 py-3 bg-white border border-slate-200 rounded-xl font-bold uppercase text-xs text-slate-500 tracking-widest hover:bg-slate-100 transition-all"
               >
                 Fechar
@@ -2293,7 +2326,7 @@ const Reports: React.FC<ReportsProps> = ({
                 </p>
               </div>
               <button 
-                onClick={() => setSelectedYearlySalesDetail(null)} 
+                onClick={() => setSelectedYearlyYear(null)} 
                 className="p-1.5 hover:bg-slate-800 rounded-full transition-colors text-slate-400 hover:text-white"
               >
                 <X className="w-5 h-5" />
@@ -2375,7 +2408,7 @@ const Reports: React.FC<ReportsProps> = ({
                 <PrinterIcon className="w-4 h-4" /> Baixar / Imprimir PDF (A4)
               </button>
               <button 
-                onClick={() => setSelectedYearlySalesDetail(null)}
+                onClick={() => setSelectedYearlyYear(null)}
                 className="flex-1 py-3 bg-white border border-slate-200 rounded-xl font-bold uppercase text-xs text-slate-500 tracking-widest hover:bg-slate-100 transition-all"
               >
                 Fechar
@@ -2442,7 +2475,7 @@ const Reports: React.FC<ReportsProps> = ({
                           <td className="px-4 py-3 text-center font-black text-slate-900">{item.quantity}</td>
                           <td className="px-4 py-3 text-right text-slate-500">{item.unitPrice.toLocaleString()} Kz</td>
                           <td className="px-4 py-3 text-right text-emerald-600 font-bold">{(item.vatAmount).toLocaleString()} Kz</td>
-                          <td className="px-4 py-3 text-right font-black text-slate-900">{(item.subtotal + item.vatAmount).toLocaleString()} Kz</td>
+                          <td className="px-4 py-3 text-right font-black text-slate-900">{roundMoney((item.subtotal || 0) + (item.vatAmount || 0)).toLocaleString()} Kz</td>
                         </tr>
                       ))
                     )}
@@ -2651,7 +2684,7 @@ const Reports: React.FC<ReportsProps> = ({
                 {activeReport === 'MONTHLY_DETAIL' && 'Relatório Mensal de Vendas Detalhado'}
                 {activeReport === 'YEARLY_DETAIL' && 'Relatório Anual de Vendas Detalhado'}
               </h2>
-              <p className="text-[9px] font-bold text-slate-600 mt-1.5">Data de Emissão: {new Date().toLocaleString('pt-AO')}</p>
+              <p className="text-[9px] font-bold text-slate-600 mt-1.5">Data de Emissão: {formatAngolaDateTime(new Date())}</p>
               {activeReport === 'INVOICE_REPRINT' && selectedInvoice && (
                 <p className="text-[9px] font-mono mt-1 text-slate-700">Documento: {selectedInvoice.invoiceNumber}</p>
               )}
@@ -3033,7 +3066,7 @@ const Reports: React.FC<ReportsProps> = ({
                       <td className="p-2 border text-center font-bold">{item.quantity}</td>
                       <td className="p-2 border text-right">{item.unitPrice.toLocaleString()} Kz</td>
                       <td className="p-2 border text-right text-emerald-700">14%</td>
-                      <td className="p-2 border text-right font-black">{(item.subtotal + item.vatAmount).toLocaleString()} Kz</td>
+                      <td className="p-2 border text-right font-black">{roundMoney((item.subtotal || 0) + (item.vatAmount || 0)).toLocaleString()} Kz</td>
                     </tr>
                   ))}
                 </tbody>

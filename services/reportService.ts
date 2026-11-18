@@ -1,5 +1,6 @@
 import { Invoice, Product, Batch, InvoiceStatus } from '../types';
 import { db, DailyClosure } from './db';
+import { roundMoney, getAngolaDateKey, summarizeInvoicesByPayment } from '../utils/financeUtils';
 
 export interface CMVProfitabilityResult {
   totalRevenueGross: number;
@@ -57,10 +58,10 @@ export const ReportService = {
 
     let filtered = invoices;
     if (startDate) {
-      filtered = filtered.filter(i => (i.date || '').slice(0, 10) >= startDate);
+      filtered = filtered.filter(i => getAngolaDateKey(i.date) >= startDate);
     }
     if (endDate) {
-      filtered = filtered.filter(i => (i.date || '').slice(0, 10) <= endDate);
+      filtered = filtered.filter(i => getAngolaDateKey(i.date) <= endDate);
     }
 
     let totalRevenueGross = 0;
@@ -74,14 +75,14 @@ export const ReportService = {
     for (const inv of filtered) {
       if (inv.status === InvoiceStatus.CANCELLED) {
         totalInvoicesCancelled++;
-        cancelledAmount += Number(inv.totalNet) || 0;
+        cancelledAmount += roundMoney(inv.totalNet);
         continue;
       }
 
       totalInvoicesIssued++;
-      totalRevenueGross += Number(inv.totalGross) || 0;
-      totalRevenueNet += Number(inv.totalNet) || 0;
-      totalVAT += Number(inv.totalVAT) || 0;
+      totalRevenueGross += roundMoney(inv.totalGross);
+      totalRevenueNet += roundMoney(inv.totalNet);
+      totalVAT += roundMoney(inv.totalVAT);
 
       for (const item of (inv.items || [])) {
         const prod = item.productId ? productMap.get(item.productId) : null;
@@ -90,7 +91,13 @@ export const ReportService = {
       }
     }
 
-    const grossProfit = totalRevenueNet - totalCostOfGoodsSold;
+    totalRevenueGross = roundMoney(totalRevenueGross);
+    totalRevenueNet = roundMoney(totalRevenueNet);
+    totalVAT = roundMoney(totalVAT);
+    totalCostOfGoodsSold = roundMoney(totalCostOfGoodsSold);
+    cancelledAmount = roundMoney(cancelledAmount);
+
+    const grossProfit = roundMoney(totalRevenueNet - totalCostOfGoodsSold);
     const grossMarginPercentage = totalRevenueNet > 0 
       ? (grossProfit / totalRevenueNet) * 100 
       : 0;
@@ -124,7 +131,7 @@ export const ReportService = {
   } {
     const validInvoices = invoices.filter(i => {
       if (i.status === InvoiceStatus.CANCELLED) return false;
-      const d = (i.date || '').slice(0, 10);
+      const d = getAngolaDateKey(i.date);
       if (startDate && d < startDate) return false;
       if (endDate && d > endDate) return false;
       return true;
@@ -139,7 +146,7 @@ export const ReportService = {
         const stat = salesStats.get(pId) || { unitsSold: 0, invoicesCount: 0, revenue: 0 };
         stat.unitsSold += Number(item.quantity) || 1;
         stat.invoicesCount += 1;
-        stat.revenue += Number(item.subtotal) || 0;
+        stat.revenue += roundMoney((Number(item.subtotal) || 0) + (Number(item.vatAmount) || 0));
         salesStats.set(pId, stat);
       }
     }
@@ -147,8 +154,9 @@ export const ReportService = {
     const results: ProductMovementAnalysis[] = products.map(prod => {
       const stat = salesStats.get(prod.id) || { unitsSold: 0, invoicesCount: 0, revenue: 0 };
       const unitCost = Number(prod.costPrice) || 0;
-      const costIncurred = unitCost * stat.unitsSold;
-      const profitGenerated = stat.revenue - costIncurred;
+      const costIncurred = roundMoney(unitCost * stat.unitsSold);
+      const revenueGenerated = roundMoney(stat.revenue);
+      const profitGenerated = roundMoney(revenueGenerated - costIncurred);
       const isLowStock = prod.totalQuantity <= (prod.minStock || 0);
       const isNoMovement = stat.unitsSold === 0;
 
@@ -161,7 +169,7 @@ export const ReportService = {
         minStock: prod.minStock,
         unitsSold: stat.unitsSold,
         invoicesCount: stat.invoicesCount,
-        revenueGenerated: stat.revenue,
+        revenueGenerated,
         costIncurred,
         profitGenerated,
         isLowStock,
@@ -191,28 +199,16 @@ export const ReportService = {
     invoices: Invoice[],
     date: string
   ): ShiftDetailReport[] {
-    const dayInvoices = invoices.filter(i => (i.date || '').slice(0, 10) === date);
+    const targetDate = getAngolaDateKey(date);
+    const dayInvoices = invoices.filter(i => getAngolaDateKey(i.date) === targetDate);
     const shiftsFound = Array.from(new Set(dayInvoices.map(i => i.shiftNumber || 1))).sort((a, b) => a - b);
 
     return shiftsFound.map(shiftNum => {
       const sInvs = dayInvoices.filter(i => (i.shiftNumber || 1) === shiftNum);
       const issued = sInvs.filter(i => i.status !== InvoiceStatus.CANCELLED);
       const cancelled = sInvs.filter(i => i.status === InvoiceStatus.CANCELLED);
+      const summary = summarizeInvoicesByPayment(issued, false);
 
-      const cash = issued
-        .filter(i => i.paymentMethod === 'Numerário' || i.paymentMethod === 'Dinheiro')
-        .reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-      const tpa = issued
-        .filter(i => i.paymentMethod === 'Multicaixa' || i.paymentMethod === 'TPA' || i.paymentMethod === 'Cartão')
-        .reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-      const transfer = issued
-        .filter(i => i.paymentMethod === 'Transferência')
-        .reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-      const mixed = issued
-        .filter(i => i.paymentMethod === 'Misto')
-        .reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-
-      const grandTotal = cash + tpa + transfer + mixed;
       const shiftName = sInvs[0]?.shiftName || `${shiftNum}º Turno`;
       const operator = sInvs[sInvs.length - 1]?.userName || 'Operador';
 
@@ -222,11 +218,11 @@ export const ReportService = {
         operator,
         issuedCount: issued.length,
         cancelledCount: cancelled.length,
-        cashTotal: cash,
-        tpaTotal: tpa,
-        transferTotal: transfer,
-        mixedTotal: mixed,
-        grandTotal
+        cashTotal: summary.cash,
+        tpaTotal: summary.tpa,
+        transferTotal: summary.transfer,
+        mixedTotal: summary.mixed,
+        grandTotal: summary.total
       };
     });
   }

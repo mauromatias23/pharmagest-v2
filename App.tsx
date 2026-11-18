@@ -94,8 +94,9 @@ const App: React.FC = () => {
 
     const initDB = async () => {
       try {
-        // 1. Garante que os dados locais mínimos existem
+        // 1. Garante que os dados locais mínimos existem e corrige eventuais inconsistências históricas
         await db.populate();
+        await SyncService.repairInconsistentTotalsIfNeeded();
         await reloadLocalData();
 
         // 2. Libera a interface IMEDIATAMENTE com os dados locais
@@ -109,6 +110,7 @@ const App: React.FC = () => {
           SyncService.syncAll()
             .then(async (res) => {
               if (res.success && mounted) {
+                await SyncService.repairInconsistentTotalsIfNeeded();
                 await reloadLocalData();
               }
             })
@@ -177,6 +179,7 @@ const App: React.FC = () => {
       try {
         if (SyncService.isConfigured() && !SyncService.isQuotaRestricted()) {
           await SyncService.syncAll();
+          await SyncService.repairInconsistentTotalsIfNeeded();
         }
         await reloadLocalData();
       } catch (err) {
@@ -216,6 +219,7 @@ const App: React.FC = () => {
         if (SyncService.isConfigured() && !SyncService.isQuotaRestricted()) {
           const res = await SyncService.fetchAllFromSupabase();
           if (res.success) {
+            await SyncService.repairInconsistentTotalsIfNeeded();
             await reloadLocalData();
           }
         }
@@ -356,13 +360,13 @@ const App: React.FC = () => {
 
   const handleAddInvoice = async (newInvoice: Invoice) => {
     try {
-      await SaleService.completeSale(newInvoice);
+      const res = await SaleService.completeSale(newInvoice);
+      const savedInvoice = res.invoice || newInvoice;
       // Atualização imediata do estado de faturas sem bloquear a tela com reload geral síncrono
-      setInvoices(prev => [newInvoice, ...prev.filter(i => i.id !== newInvoice.id)]);
-      // Dispara recarregamento e envio assíncrono em segundo plano
+      setInvoices(prev => [savedInvoice, ...prev.filter(i => i.id !== savedInvoice.id)]);
+      // Recarrega o estado local (SaleService.completeSale já agenda SyncService.processQueue com segurança)
       setTimeout(() => {
         reloadLocalData().catch(() => {});
-        SyncService.processQueue().then(() => reloadLocalData()).catch(() => {});
       }, 50);
     } catch (err: any) {
       console.error('[handleAddInvoice Error]', err);
@@ -380,10 +384,13 @@ const App: React.FC = () => {
       return;
     }
     try {
-      await SaleService.cancelSale(invoiceId, 'Anulação solicitada pelo Administrador');
+      await SaleService.cancelInvoice(
+        invoiceId,
+        currentUser?.id || '',
+        currentUser?.name || 'Administrador',
+        'Anulação solicitada pelo Administrador'
+      );
       await reloadLocalData();
-      // Dispara envio em segundo plano
-      SyncService.processQueue().then(() => reloadLocalData()).catch(() => {});
     } catch (err: any) {
       console.error('[handleCancelInvoice Error]', err);
       alert(`Erro ao anular fatura: ${err.message || err}`);
@@ -540,6 +547,7 @@ const App: React.FC = () => {
           onUpdateProduct={handleUpdateProduct}
           onAddProduct={handleAddProduct}
           onDeleteProduct={handleDeleteProduct}
+          onRefreshData={reloadLocalData}
         />
       )}
       {activeTab === 'billing' && (

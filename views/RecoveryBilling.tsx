@@ -4,6 +4,7 @@ import { COMPANY_INFO, VAT_RATE, PAYMENT_METHODS } from '../constants';
 import { db } from '../services/db';
 import { DeviceService } from '../services/deviceService';
 import { SyncService } from '../services/syncService';
+import { roundMoney, calculateItemTotals, getCanonicalPaymentLabel } from '../utils/financeUtils';
 import { 
   Search, Trash2, Banknote, CreditCard, Landmark, Layers, History, X, Plus, Minus, 
   Printer as PrinterIcon, CheckCircle, FileText, AlertCircle, ShieldCheck, ArrowRight, 
@@ -95,9 +96,9 @@ export const RecoveryBilling: React.FC<RecoveryBillingProps> = ({
 
   // Resumo do Carrinho
   const cartSummary = useMemo(() => {
-    const gross = cart.reduce((sum, item) => sum + item.subtotal, 0);
-    const vat = cart.reduce((sum, item) => sum + item.vatAmount, 0);
-    return { gross, vat, net: gross + vat };
+    const gross = roundMoney(cart.reduce((sum, item) => sum + (Number(item.subtotal) || 0), 0));
+    const vat = roundMoney(cart.reduce((sum, item) => sum + (Number(item.vatAmount) || 0), 0));
+    return { gross, vat, net: roundMoney(gross + vat) };
   }, [cart]);
 
   // Filtragem de Produtos
@@ -127,8 +128,7 @@ export const RecoveryBilling: React.FC<RecoveryBillingProps> = ({
     if (existing) {
       updateQuantity(existing.id, 1);
     } else {
-      const subtotal = product.sellPrice;
-      const vatAmount = product.hasVAT ? subtotal * VAT_RATE : 0;
+      const { subtotal, vatAmount } = calculateItemTotals(1, product.sellPrice, product.hasVAT !== false, VAT_RATE);
       const newItem: InvoiceItem = {
         id: DeviceService.generateOperationId(),
         productId: product.id,
@@ -137,10 +137,10 @@ export const RecoveryBilling: React.FC<RecoveryBillingProps> = ({
         lotNumber: batch.lotNumber,
         quantity: 1,
         unitPrice: product.sellPrice,
-        subtotal: subtotal,
-        vatAmount: vatAmount,
+        subtotal,
+        vatAmount,
         costPriceHistorical: product.costPrice || 0,
-        totalCostHistorical: product.costPrice || 0
+        totalCostHistorical: roundMoney(product.costPrice || 0)
       };
       setCart(prev => [...prev, newItem]);
     }
@@ -157,14 +157,15 @@ export const RecoveryBilling: React.FC<RecoveryBillingProps> = ({
           alert(`Stock insuficiente no lote ${batch.lotNumber}! Quantidade máxima disponível: ${batch.quantity}`);
           return item;
         }
-        const subtotal = newQty * item.unitPrice;
         const product = products.find(p => p.id === item.productId);
+        const hasVAT = product ? product.hasVAT !== false : item.vatAmount > 0;
+        const { subtotal, vatAmount } = calculateItemTotals(newQty, item.unitPrice, hasVAT, VAT_RATE);
         return {
           ...item,
           quantity: newQty,
-          subtotal: subtotal,
-          vatAmount: (product?.hasVAT) ? subtotal * VAT_RATE : 0,
-          totalCostHistorical: (item.costPriceHistorical || 0) * newQty
+          subtotal,
+          vatAmount,
+          totalCostHistorical: roundMoney((item.costPriceHistorical || 0) * newQty)
         };
       }
       return item;
@@ -215,7 +216,7 @@ export const RecoveryBilling: React.FC<RecoveryBillingProps> = ({
         totalVAT: cartSummary.vat,
         totalNet: cartSummary.net,
         status: InvoiceStatus.ISSUED,
-        paymentMethod: paymentMethod,
+        paymentMethod: getCanonicalPaymentLabel(paymentMethod),
         items: [...cart],
         closed: true, // Já pertence a período passado, portanto fica fechada
         shiftNumber: 1,
@@ -631,7 +632,7 @@ export const RecoveryBilling: React.FC<RecoveryBillingProps> = ({
                       </div>
 
                       <p className="font-black text-xs text-slate-900">
-                        {item.subtotal.toLocaleString()} Kz
+                        {roundMoney((item.subtotal || 0) + (item.vatAmount || 0)).toLocaleString()} Kz
                       </p>
                     </div>
                   </div>
@@ -900,7 +901,7 @@ export const RecoveryBilling: React.FC<RecoveryBillingProps> = ({
                   </td>
                   <td className="py-1 text-center font-bold">{item.quantity}</td>
                   <td className="py-1 text-right">{item.unitPrice.toLocaleString()}</td>
-                  <td className="py-1 text-right font-bold">{item.subtotal.toLocaleString()}</td>
+                  <td className="py-1 text-right font-bold">{roundMoney((item.subtotal || 0) + (item.vatAmount || 0)).toLocaleString()}</td>
                 </tr>
               ))}
             </tbody>

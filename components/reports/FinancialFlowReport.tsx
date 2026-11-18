@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Invoice, User, UserRole, OtherIncome } from '../../types';
 import { FinancialService, FinancialFlowSummary } from '../../services/financialService';
+import { getTodayAngolaDateKey } from '../../utils/financeUtils';
 import { COMPANY_INFO } from '../../constants';
 import { 
   ArrowUpRight, 
@@ -25,10 +26,9 @@ interface FinancialFlowReportProps {
 }
 
 export const FinancialFlowReport: React.FC<FinancialFlowReportProps> = ({ invoices, user }) => {
-  // Datas padrão: mês atual
-  const now = new Date();
-  const firstDayStr = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
-  const todayStr = now.toISOString().slice(0, 10);
+  // Datas padrão: mês atual no calendário de Angola
+  const todayStr = getTodayAngolaDateKey();
+  const firstDayStr = `${todayStr.slice(0, 7)}-01`;
 
   const [startDate, setStartDate] = useState(firstDayStr);
   const [endDate, setEndDate] = useState(todayStr);

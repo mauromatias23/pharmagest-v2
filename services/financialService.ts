@@ -1,6 +1,7 @@
 import { db } from './db';
 import { Expense, ExpenseCategory, OtherIncome, Invoice, Product, InvoiceStatus } from '../types';
 import { DeviceService } from './deviceService';
+import { roundMoney, getAngolaDateKey, getTodayAngolaDateKey } from '../utils/financeUtils';
 
 export interface FinancialFlowSummary {
   periodLabel: string;
@@ -76,10 +77,10 @@ export const FinancialService = {
       id: expenseId,
       operationId,
       deviceId,
-      date: data.date || createdAt.slice(0, 10),
+      date: data.date || getTodayAngolaDateKey(),
       category: data.category,
       description: data.description.trim(),
-      amount: Math.max(0, Number(data.amount) || 0),
+      amount: Math.max(0, roundMoney(data.amount)),
       paymentMethod: data.paymentMethod || 'Numerário',
       responsible: data.responsible?.trim() || '',
       notes: data.notes?.trim() || '',
@@ -204,10 +205,10 @@ export const FinancialService = {
       id,
       operationId,
       deviceId,
-      date: data.date || createdAt.slice(0, 10),
+      date: data.date || getTodayAngolaDateKey(),
       description: data.description.trim(),
       category: data.category || 'Outras receitas',
-      amount: Math.max(0, Number(data.amount) || 0),
+      amount: Math.max(0, roundMoney(data.amount)),
       paymentMethod: data.paymentMethod || 'Numerário',
       responsible: data.responsible?.trim() || '',
       notes: data.notes?.trim() || '',
@@ -288,24 +289,24 @@ export const FinancialService = {
     startDate: string,
     endDate: string
   ): Promise<FinancialFlowSummary> {
-    // 1. Filtrar Vendas do período (não anuladas)
+    // 1. Filtrar Vendas do período (não anuladas) usando calendário de Angola
     const periodInvoices = invoices.filter(inv => {
       if (inv.status === InvoiceStatus.CANCELLED) return false;
-      const d = (inv.date || '').slice(0, 10);
+      const d = getAngolaDateKey(inv.date);
       return d >= startDate && d <= endDate;
     });
 
-    const salesGross = periodInvoices.reduce((acc, i) => acc + (Number(i.totalGross) || 0), 0);
-    const salesNet = periodInvoices.reduce((acc, i) => acc + (Number(i.totalNet) || 0), 0);
+    const salesGross = roundMoney(periodInvoices.reduce((acc, i) => acc + (Number(i.totalGross) || 0), 0));
+    const salesNet = roundMoney(periodInvoices.reduce((acc, i) => acc + (Number(i.totalNet) || 0), 0));
     const salesCount = periodInvoices.length;
 
     // 2. Filtrar Outras Receitas
     const allOtherIncomes = await this.getOtherIncomes({ startDate, endDate });
     const activeOtherIncomes = allOtherIncomes.filter(i => i.status !== 'CANCELLED');
-    const otherIncomesTotal = activeOtherIncomes.reduce((acc, i) => acc + (Number(i.amount) || 0), 0);
+    const otherIncomesTotal = roundMoney(activeOtherIncomes.reduce((acc, i) => acc + (Number(i.amount) || 0), 0));
     const otherIncomesCount = activeOtherIncomes.length;
 
-    const totalInflow = salesNet + otherIncomesTotal;
+    const totalInflow = roundMoney(salesNet + otherIncomesTotal);
 
     // 3. Filtrar Despesas do período
     const allExpenses = await this.getExpenses({ startDate, endDate });
@@ -314,28 +315,28 @@ export const FinancialService = {
     // Categorias de Saídas solicitadas:
     // Compras
     const purchasesExpenses = activeExpenses.filter(e => e.category === 'Compra de medicamentos');
-    const purchasesTotal = purchasesExpenses.reduce((acc, e) => acc + (Number(e.amount) || 0), 0);
+    const purchasesTotal = roundMoney(purchasesExpenses.reduce((acc, e) => acc + (Number(e.amount) || 0), 0));
     const purchasesCount = purchasesExpenses.length;
 
     // Salários
     const salariesExpenses = activeExpenses.filter(e => e.category === 'Salários');
-    const salariesTotal = salariesExpenses.reduce((acc, e) => acc + (Number(e.amount) || 0), 0);
+    const salariesTotal = roundMoney(salariesExpenses.reduce((acc, e) => acc + (Number(e.amount) || 0), 0));
     const salariesCount = salariesExpenses.length;
 
     // Despesas administrativas: Renda/aluguer, Material de escritório, Impostos/taxas, Internet
     const adminCategories: ExpenseCategory[] = ['Renda/aluguer', 'Material de escritório', 'Impostos/taxas', 'Internet'];
     const adminExpenses = activeExpenses.filter(e => adminCategories.includes(e.category));
-    const administrativeTotal = adminExpenses.reduce((acc, e) => acc + (Number(e.amount) || 0), 0);
+    const administrativeTotal = roundMoney(adminExpenses.reduce((acc, e) => acc + (Number(e.amount) || 0), 0));
     const administrativeCount = adminExpenses.length;
 
     // Despesas operacionais: Energia, Água, Transporte, Manutenção, Limpeza, Equipamentos, Outros
     const operationalCategories: ExpenseCategory[] = ['Energia', 'Água', 'Transporte', 'Manutenção', 'Limpeza', 'Equipamentos', 'Outros'];
     const operationalExpenses = activeExpenses.filter(e => operationalCategories.includes(e.category));
-    const operationalTotal = operationalExpenses.reduce((acc, e) => acc + (Number(e.amount) || 0), 0);
+    const operationalTotal = roundMoney(operationalExpenses.reduce((acc, e) => acc + (Number(e.amount) || 0), 0));
     const operationalCount = operationalExpenses.length;
 
-    const totalOutflow = purchasesTotal + salariesTotal + administrativeTotal + operationalTotal;
-    const netBalance = totalInflow - totalOutflow;
+    const totalOutflow = roundMoney(purchasesTotal + salariesTotal + administrativeTotal + operationalTotal);
+    const netBalance = roundMoney(totalInflow - totalOutflow);
 
     return {
       periodLabel: `${startDate} a ${endDate}`,
@@ -391,10 +392,10 @@ export const FinancialService = {
     const diffTime = Math.abs(end.getTime() - start.getTime());
     const totalDaysAnalyzed = Math.max(1, Math.round(diffTime / (1000 * 60 * 60 * 24)) + 1);
 
-    // 2. Filtrar faturas válidas do período
+    // 2. Filtrar faturas válidas do período usando calendário de Angola
     const periodInvoices = invoices.filter(inv => {
       if (inv.status === InvoiceStatus.CANCELLED) return false;
-      const d = (inv.date || '').slice(0, 10);
+      const d = getAngolaDateKey(inv.date);
       return d >= startDate && d <= endDate;
     });
 
@@ -404,7 +405,7 @@ export const FinancialService = {
     const productRevenueMap = new Map<string, number>();
 
     for (const inv of periodInvoices) {
-      const dayStr = (inv.date || '').slice(0, 10);
+      const dayStr = getAngolaDateKey(inv.date);
       if (!dayStr) continue;
 
       for (const item of (inv.items || [])) {
@@ -419,7 +420,10 @@ export const FinancialService = {
 
         productDaysMap.get(pId)!.add(dayStr);
         productUnitsMap.set(pId, (productUnitsMap.get(pId) || 0) + (Number(item.quantity) || 1));
-        productRevenueMap.set(pId, (productRevenueMap.get(pId) || 0) + (Number(item.subtotal) || 0));
+        productRevenueMap.set(
+          pId,
+          (productRevenueMap.get(pId) || 0) + roundMoney((Number(item.subtotal) || 0) + (Number(item.vatAmount) || 0))
+        );
       }
     }
 
@@ -429,7 +433,7 @@ export const FinancialService = {
       const daysWithSales = daysSet ? daysSet.size : 0;
       const frequencyPercentage = (daysWithSales / totalDaysAnalyzed) * 100;
       const totalUnitsSold = productUnitsMap.get(prod.id) || 0;
-      const totalRevenue = productRevenueMap.get(prod.id) || 0;
+      const totalRevenue = roundMoney(productRevenueMap.get(prod.id) || 0);
 
       return {
         productId: prod.id,

@@ -6,16 +6,32 @@ import {
   type Batch, 
   type Invoice, 
   type InvoiceItem, 
+  type SyncOperation,
+  UserRole,
   InvoiceStatus,
   SyncOperationStatus,
   SyncOperationType
 } from '../types';
 import { DeviceService } from './deviceService';
 import { AuthVault } from './authVault';
+import {
+  roundMoney,
+  getAngolaDateKey,
+  getTodayAngolaDateKey,
+  summarizeInvoicesByPayment
+} from '../utils/financeUtils';
 
 let realtimeChannel: any = null;
 let autoReconnectInterval: any = null;
 let isAutoSyncing = false;
+
+// Mutex de serialização para evitar execuções concorrentes de processQueue / pushAll / fetchAll
+let _syncExecutionChain: Promise<unknown> = Promise.resolve();
+function withSyncLock<T>(task: () => Promise<T>): Promise<T> {
+  const next = _syncExecutionChain.then(task, task);
+  _syncExecutionChain = next.catch(() => {});
+  return next;
+}
 
 let broadcastChannel: BroadcastChannel | null = null;
 if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -149,14 +165,30 @@ export const SyncService = {
           return;
         }
 
-        const pendingDelete = await db.syncQueue
+        const pendingProdOp = await db.syncQueue
           .where('entityId')
           .equals(prodId)
-          .filter(op => op.status === SyncOperationStatus.PENDING && op.operationType === SyncOperationType.DELETE)
+          .filter(op =>
+            (op.status === SyncOperationStatus.PENDING || op.status === SyncOperationStatus.SYNCING) &&
+            op.entityType === 'PRODUCT'
+          )
           .first();
-        if (pendingDelete) {
+        if (pendingProdOp) {
           return;
         }
+
+        // Não sobrescrever stock se existirem faturas locais ainda não sincronizadas que referenciam este produto
+        const hasUnsyncedProductInvoice = (await db.invoices.toArray()).some(
+          inv => inv.synchronized === false && (inv.items || []).some(it => it.productId === prodId)
+        );
+        if (hasUnsyncedProductInvoice) {
+          return;
+        }
+
+        const localBatches = await db.batches.where('productId').equals(prodId).toArray();
+        const authoritativeStock = localBatches.length > 0
+          ? Math.max(0, localBatches.reduce((sum, b) => sum + Math.max(0, Number(b.quantity) || 0), 0))
+          : Math.max(0, Number(newRecord.total_quantity) || 0);
 
         const p: Product = {
           id: newRecord.id,
@@ -171,7 +203,7 @@ export const SyncService = {
           hasVAT: newRecord.has_vat ?? true,
           supplier: newRecord.supplier || '',
           minStock: Number(newRecord.min_stock) || 0,
-          totalQuantity: Number(newRecord.total_quantity) || 0,
+          totalQuantity: authoritativeStock,
           active: newRecord.active ?? true
         };
         await db.products.put(p);
@@ -186,12 +218,23 @@ export const SyncService = {
           return;
         }
 
-        const pendingBatchDel = await db.syncQueue
+        const pendingBatchOp = await db.syncQueue
           .where('entityId')
           .equals(batchId)
-          .filter(op => op.status === SyncOperationStatus.PENDING && op.operationType === SyncOperationType.DELETE)
+          .filter(op =>
+            (op.status === SyncOperationStatus.PENDING || op.status === SyncOperationStatus.SYNCING) &&
+            op.entityType === 'BATCH'
+          )
           .first();
-        if (pendingBatchDel) {
+        if (pendingBatchOp) {
+          return;
+        }
+
+        // Proteger contra eco Realtime antes que a fatura offline ou fila termine de sincronizar
+        const hasUnsyncedBatchInvoice = (await db.invoices.toArray()).some(
+          inv => inv.synchronized === false && (inv.items || []).some(it => it.batchId === batchId)
+        );
+        if (hasUnsyncedBatchInvoice) {
           return;
         }
 
@@ -204,6 +247,16 @@ export const SyncService = {
           entryDate: newRecord.entry_date
         };
         await db.batches.put(b);
+
+        // Recalcular imediatamente totalQuantity do produto pai a partir dos lotes reais
+        if (prodId) {
+          const prod = await db.products.get(prodId);
+          if (prod) {
+            const allProdBatches = await db.batches.where('productId').equals(prodId).toArray();
+            const sumQty = allProdBatches.reduce((sum, bt) => sum + Math.max(0, Number(bt.quantity) || 0), 0);
+            await db.products.update(prodId, { totalQuantity: Math.max(0, sumQty) });
+          }
+        }
       } else if (table === 'invoices') {
         // Verificar se a fatura não está em estado PENDING localmente
         const existingLocal = await db.invoices.get(newRecord.id);
@@ -211,6 +264,35 @@ export const SyncService = {
           // Operação local pendente prevalece
           return;
         }
+
+        let resolvedItems: InvoiceItem[] = existingLocal?.items || [];
+        if (resolvedItems.length === 0) {
+          const supabase = getSupabase();
+          if (supabase && !this.isQuotaRestricted()) {
+            try {
+              const { data: remoteItems } = await supabase
+                .from('invoice_items')
+                .select('*')
+                .eq('invoice_id', newRecord.id);
+              if (remoteItems && remoteItems.length > 0) {
+                resolvedItems = remoteItems.map((it: any) => ({
+                  id: it.id,
+                  productId: it.product_id,
+                  productName: it.product_name,
+                  batchId: it.batch_id,
+                  lotNumber: it.lot_number,
+                  quantity: Number(it.quantity) || 1,
+                  unitPrice: Number(it.unit_price) || 0,
+                  subtotal: Number(it.subtotal) || 0,
+                  vatAmount: Number(it.vat_amount) || 0
+                }));
+              }
+            } catch (itemsFetchErr) {
+              console.warn('[handleSurgicalRealtimeChange] Aviso ao buscar itens da fatura:', itemsFetchErr);
+            }
+          }
+        }
+
         const inv: Invoice & { synchronized: boolean } = {
           id: newRecord.id,
           invoiceNumber: newRecord.invoice_number,
@@ -225,7 +307,7 @@ export const SyncService = {
           totalNet: Number(newRecord.total_net) || 0,
           status: newRecord.status as InvoiceStatus,
           paymentMethod: newRecord.payment_method,
-          items: existingLocal?.items || [],
+          items: resolvedItems,
           closed: newRecord.closed ?? false,
           closureId: newRecord.closure_id || undefined,
           shiftNumber: newRecord.shift_number || 1,
@@ -446,6 +528,10 @@ export const SyncService = {
    * Transita de PENDING -> SYNCING -> SYNCED com confirmação individual.
    */
   async processQueue(): Promise<{ processed: number; succeeded: number; failed: number }> {
+    return withSyncLock(() => this._processQueueInternal());
+  },
+
+  async _processQueueInternal(): Promise<{ processed: number; succeeded: number; failed: number }> {
     if (!this.isConfigured() || this.isQuotaRestricted()) {
       return { processed: 0, succeeded: 0, failed: 0 };
     }
@@ -473,8 +559,11 @@ export const SyncService = {
 
         if (op.entityType === 'INVOICE') {
           if (op.operationType === SyncOperationType.CREATE) {
-            const inv = op.payload as Invoice;
-            // 1. Enviar fatura
+            const payloadInv = op.payload as Invoice;
+            const latestLocalInv = await db.invoices.get(payloadInv.id);
+            const inv = latestLocalInv || payloadInv;
+
+            // 1. Enviar fatura (sem re-subtrair stock manualmente; lotes e produtos têm operações próprias na fila)
             const { error: invErr } = await supabase.from('invoices').upsert({
               id: inv.id,
               invoice_number: inv.invoiceNumber,
@@ -511,28 +600,6 @@ export const SyncService = {
                   vat_amount: Number(it.vatAmount) || 0
                 }));
                 await supabase.from('invoice_items').upsert(itemsToUpsert, { onConflict: 'id' });
-                
-                // Atualizar quantidades nos lotes e produtos do Supabase para refletir a venda
-                for (const it of inv.items) {
-                  if (it.batchId) {
-                    try {
-                      const { data: bRow } = await supabase.from('batches').select('quantity').eq('id', it.batchId).maybeSingle();
-                      if (bRow) {
-                        const newQ = Math.max(0, (Number(bRow.quantity) || 0) - (Number(it.quantity) || 0));
-                        await supabase.from('batches').update({ quantity: newQ }).eq('id', it.batchId);
-                      }
-                    } catch (bErr) {}
-                  }
-                  if (it.productId) {
-                    try {
-                      const { data: allB } = await supabase.from('batches').select('quantity').eq('product_id', it.productId);
-                      if (allB) {
-                        const tot = allB.reduce((sum, b) => sum + Math.max(0, Number(b.quantity) || 0), 0);
-                        await supabase.from('products').update({ total_quantity: tot }).eq('id', it.productId);
-                      }
-                    } catch (pErr) {}
-                  }
-                }
               }
               opSuccess = true;
               await db.invoices.update(inv.id, { synchronized: true });
@@ -578,7 +645,6 @@ export const SyncService = {
             );
             if (res.success) {
               opSuccess = true;
-              // Garante que o tombstone persiste em db.deletedRecords
               const now = Date.now();
               await db.deletedRecords.put({ id: op.entityId, table: 'products', timestamp: now });
               if (op.payload?.batchIds && Array.isArray(op.payload.batchIds)) {
@@ -586,7 +652,6 @@ export const SyncService = {
                   await db.deletedRecords.put({ id: bId, table: 'batches', timestamp: now });
                 }
               }
-              // Garante que o produto e lotes estão fora do Dexie local
               await db.products.delete(op.entityId);
               if (op.payload?.batchIds && Array.isArray(op.payload.batchIds)) {
                 for (const bId of op.payload.batchIds) {
@@ -597,13 +662,19 @@ export const SyncService = {
               opSuccess = false;
             }
           } else if (op.operationType === SyncOperationType.CREATE || op.operationType === SyncOperationType.UPDATE) {
-            // Verificar se não foi excluído posteriormente
             const isDel = await db.deletedRecords.get(op.entityId);
             if (isDel) {
-              opSuccess = true; // Ignora pois foi excluído
+              opSuccess = true;
             } else {
-              const p = op.payload as Product;
+              // Usar sempre o estado local mais atualizado do produto para evitar regressão por payloads antigos
+              const latestProd = await db.products.get(op.entityId);
+              const p = latestProd || (op.payload as Product);
               if (p) {
+                const prodBatches = await db.batches.where('productId').equals(p.id).toArray();
+                const authoritativeQty = prodBatches.length > 0
+                  ? Math.max(0, prodBatches.reduce((sum, bt) => sum + Math.max(0, Number(bt.quantity) || 0), 0))
+                  : Math.max(0, Number(p.totalQuantity) || 0);
+
                 const { error: pErr } = await supabase.from('products').upsert({
                   id: p.id,
                   code: p.code,
@@ -617,7 +688,7 @@ export const SyncService = {
                   has_vat: p.hasVAT,
                   supplier: p.supplier || null,
                   min_stock: Number(p.minStock) || 0,
-                  total_quantity: Number(p.totalQuantity) || 0,
+                  total_quantity: authoritativeQty,
                   active: p.active ?? true,
                   updated_at: new Date().toISOString()
                 }, { onConflict: 'id' });
@@ -640,7 +711,9 @@ export const SyncService = {
             if (isDel) {
               opSuccess = true;
             } else {
-              const b = op.payload as Batch;
+              // Usar sempre o estado local mais atualizado do lote para evitar regressão por payloads antigos
+              const latestBatch = await db.batches.get(op.entityId);
+              const b = latestBatch || (op.payload as Batch);
               if (b) {
                 const { error: bErr } = await supabase.from('batches').upsert({
                   id: b.id,
@@ -843,6 +916,19 @@ export const SyncService = {
     pushedBatches?: number;
     message: string 
   }> {
+    return withSyncLock(() => this._pushAllLocalInternal());
+  },
+
+  async _pushAllLocalInternal(): Promise<{ 
+    success: boolean; 
+    pushed: number; 
+    pushedInvoices: number; 
+    pushedItems: number; 
+    pushedClosures: number; 
+    pushedProducts?: number;
+    pushedBatches?: number;
+    message: string 
+  }> {
     if (!this.isConfigured()) {
       return { success: false, pushed: 0, pushedInvoices: 0, pushedItems: 0, pushedClosures: 0, message: 'Supabase não está configurado.' };
     }
@@ -866,7 +952,7 @@ export const SyncService = {
     try {
       // 0. Processar fila pendente prioritária (operações DELETE têm precedência absoluta)
       try {
-        await this.processQueue();
+        await this._processQueueInternal();
       } catch (qErr) {}
 
       // Obter tombstones de produtos e lotes eliminados
@@ -926,6 +1012,16 @@ export const SyncService = {
             active: p.active
           };
         });
+        // Garantir consistência local do totalQuantity com os lotes locais
+        for (const p of localProducts) {
+          const prodBatches = allLocalBatches.filter(b => b.productId === p.id && !deletedBatchIds.has(b.id));
+          if (prodBatches.length > 0) {
+            const consolidatedStock = prodBatches.reduce((acc, b) => acc + Math.max(0, Number(b.quantity) || 0), 0);
+            if (p.totalQuantity !== consolidatedStock) {
+              await db.products.update(p.id, { totalQuantity: consolidatedStock }).catch(() => {});
+            }
+          }
+        }
         // Envio em lotes de 50 produtos para evitar limites de payload
         for (let i = 0; i < productsData.length; i += 50) {
           const chunk = productsData.slice(i, i + 50);
@@ -948,13 +1044,15 @@ export const SyncService = {
 
       // 3. Enviar Lotes locais (estritamente não eliminados e de produtos válidos)
       const validBatchIds = new Set<string>();
-      if (allLocalBatches.length > 0) {
-        const safeBatches = allLocalBatches.filter(b => 
-          b.productId && 
-          !deletedBatchIds.has(b.id) && 
-          !deletedProductIds.has(b.productId) && 
-          (validProductIds.size === 0 || validProductIds.has(b.productId))
-        );
+      const safeBatches = allLocalBatches.filter(b => 
+        b.productId && 
+        !deletedBatchIds.has(b.id) && 
+        !deletedProductIds.has(b.productId) && 
+        (validProductIds.size === 0 || validProductIds.has(b.productId))
+      );
+      const localSafeBatchIds = new Set(safeBatches.map(b => b.id));
+
+      if (safeBatches.length > 0) {
         const batchesData = safeBatches.map(b => ({
           id: b.id,
           product_id: b.productId,
@@ -980,6 +1078,24 @@ export const SyncService = {
             console.warn('[pushAllLocalToSupabase] Exceção em lotes:', bChunkErr);
           }
         }
+      }
+
+      // 3.1. Limpar ou zerar lotes fantasmas antigos na nuvem que já não existem localmente
+      try {
+        const { data: remoteBatchesList } = await supabase.from('batches').select('id, product_id, quantity');
+        if (remoteBatchesList && remoteBatchesList.length > 0) {
+          for (const rb of remoteBatchesList) {
+            const belongsToPushedProduct = validProductIds.has(rb.product_id) || deletedProductIds.has(rb.product_id);
+            if (belongsToPushedProduct && !localSafeBatchIds.has(rb.id)) {
+              const { error: delErr } = await supabase.from('batches').delete().eq('id', rb.id);
+              if (delErr && Number(rb.quantity) > 0) {
+                await supabase.from('batches').update({ quantity: 0 }).eq('id', rb.id);
+              }
+            }
+          }
+        }
+      } catch (cleanupErr) {
+        console.warn('[pushAllLocalToSupabase] Aviso ao reconciliar lotes antigos na nuvem:', cleanupErr);
       }
 
       // 4. Enviar Faturas locais (incluindo todas as vendas locais de 11 a 21 de setembro)
@@ -1175,6 +1291,10 @@ export const SyncService = {
    * NUNCA envia cache antigo de volta para o Supabase.
    */
   async fetchAllFromSupabase(): Promise<{ success: boolean; pulled: number; message: string }> {
+    return withSyncLock(() => this._fetchAllFromSupabaseInternal());
+  },
+
+  async _fetchAllFromSupabaseInternal(): Promise<{ success: boolean; pulled: number; message: string }> {
     if (!this.isConfigured()) {
       return { success: false, pulled: 0, message: 'Supabase não está configurado.' };
     }
@@ -1219,16 +1339,15 @@ export const SyncService = {
       // Se todas as consultas correram bem, limpa qualquer restrição anterior
       this.setQuotaRestricted(false, '');
 
-      // 5.1. IDENTIFICAR PRODUTOS E LOTES ELIMINADOS (Tombstones locais + Fila pendente)
+      // 5.1. IDENTIFICAR PRODUTOS E LOTES ELIMINADOS E OPERAÇÕES PENDENTES (PENDING ou SYNCING)
       const allDeleted = await db.deletedRecords.toArray();
       const deletedProductIds = new Set(allDeleted.filter(d => d.table === 'products').map(d => d.id));
       const deletedBatchIds = new Set(allDeleted.filter(d => d.table === 'batches').map(d => d.id));
 
-      const pendingDeletes = await db.syncQueue
-        .where('status')
-        .equals(SyncOperationStatus.PENDING)
+      const activeQueueOps = await db.syncQueue
+        .filter(op => op.status === SyncOperationStatus.PENDING || op.status === SyncOperationStatus.SYNCING)
         .toArray();
-      pendingDeletes.forEach(op => {
+      activeQueueOps.forEach(op => {
         if (op.operationType === SyncOperationType.DELETE) {
           if (op.entityType === 'PRODUCT') deletedProductIds.add(op.entityId);
           if (op.entityType === 'BATCH') deletedBatchIds.add(op.entityId);
@@ -1261,7 +1380,7 @@ export const SyncService = {
       const currentLocalProducts = await db.products.toArray();
       for (const locProd of currentLocalProducts) {
         if (!validRemoteProductIds.has(locProd.id)) {
-          const isPendingCreate = pendingDeletes.some(op => 
+          const isPendingCreate = activeQueueOps.some(op => 
             op.entityId === locProd.id && 
             op.entityType === 'PRODUCT' && 
             op.operationType === SyncOperationType.CREATE
@@ -1451,18 +1570,30 @@ export const SyncService = {
       // O Supabase apenas atualiza se o registo local não tiver alterações pendentes.
       const currentLocalBatches = await db.batches.toArray();
       const localBatchMap = new Map(currentLocalBatches.map(b => [b.id, b]));
+      const currentLocalInvoices = await db.invoices.toArray();
 
-      // Obter operações pendentes de produtos ou lotes na syncQueue para respeitar prioridade local
+      // Obter operações pendentes (PENDING/SYNCING) e faturas offline para não reverter stock local atualizado
       const pendingBatchOps = new Set(
-        pendingDeletes
+        activeQueueOps
           .filter(op => op.entityType === 'BATCH')
           .map(op => op.entityId)
       );
+      const pendingProductOps = new Set(
+        activeQueueOps
+          .filter(op => op.entityType === 'PRODUCT')
+          .map(op => op.entityId)
+      );
+      const unsyncedBatchIds = new Set<string>();
+      const unsyncedProductIds = new Set<string>();
+      currentLocalInvoices.forEach(inv => {
+        if (inv.synchronized === false) {
+          (inv.items || []).forEach(it => {
+            if (it.batchId) unsyncedBatchIds.add(it.batchId);
+            if (it.productId) unsyncedProductIds.add(it.productId);
+          });
+        }
+      });
 
-      // Mesclagem de lotes:
-      // - Se o lote existe localmente e a quantidade local for menor devido a vendas efetuadas offline,
-      //   a quantidade local mais recente prevalece para evitar inflar o stock indevidamente!
-      // - Se for lote novo no Supabase, é adicionado.
       const finalBatchesToSave: Batch[] = [];
       const processedBatchIds = new Set<string>();
 
@@ -1470,30 +1601,21 @@ export const SyncService = {
         processedBatchIds.add(remoteB.id);
         const localB = localBatchMap.get(remoteB.id);
         if (!localB) {
-          // Lote novo que veio do Supabase
           finalBatchesToSave.push(remoteB);
         } else {
-          // Se houver alteração pendente local ou se o lote local foi modificado/ajustado
-          if (pendingBatchOps.has(remoteB.id)) {
+          // Se houver alteração local pendente na fila ou venda offline envolvendo este lote, preserva o valor local!
+          if (pendingBatchOps.has(remoteB.id) || unsyncedBatchIds.has(remoteB.id)) {
             finalBatchesToSave.push(localB);
           } else {
-            // Preserva a quantidade local mais fidedigna à realidade da empresa:
-            // NUNCA reduz forçadamente com Math.min, evitando anular acertos de stock e compras!
-            const localQty = Number(localB.quantity) || 0;
-            const remoteQty = Number(remoteB.quantity) || 0;
-            // Se local tem quantidade válida, ela reflete as contagens e vendas locais
-            const chosenQty = localB.quantity !== undefined ? localQty : remoteQty;
             finalBatchesToSave.push({
               ...remoteB,
-              lotNumber: localB.lotNumber || remoteB.lotNumber,
-              expiryDate: localB.expiryDate || remoteB.expiryDate,
-              quantity: Math.max(0, chosenQty)
+              quantity: Math.max(0, Number(remoteB.quantity) || 0)
             });
           }
         }
       }
 
-      // Adicionar lotes existentes apenas no Dexie local (criados localmente ou não sincronizados)
+      // Adicionar lotes existentes apenas no Dexie local (criados localmente ou ainda não sincronizados)
       for (const localB of currentLocalBatches) {
         if (!processedBatchIds.has(localB.id) && !deletedBatchIds.has(localB.id) && !deletedProductIds.has(localB.productId)) {
           finalBatchesToSave.push(localB);
@@ -1510,17 +1632,23 @@ export const SyncService = {
       for (const remoteP of mappedProducts) {
         processedProductIds.add(remoteP.id);
         const localP = localProductMap.get(remoteP.id);
+        const hasPendingProd = pendingProductOps.has(remoteP.id) || unsyncedProductIds.has(remoteP.id);
         const prodBatches = finalBatchesToSave.filter(b => b.productId === remoteP.id);
         const accurateStock = prodBatches.length > 0
           ? Math.max(0, prodBatches.reduce((sum, b) => sum + Math.max(0, Number(b.quantity) || 0), 0))
-          : Math.max(0, Number(localP?.totalQuantity !== undefined ? localP.totalQuantity : remoteP.totalQuantity) || 0);
+          : Math.max(0, Number(hasPendingProd && localP ? localP.totalQuantity : remoteP.totalQuantity) || 0);
 
-        finalProductsToSave.push({
-          ...remoteP,
-          sellPrice: localP?.sellPrice !== undefined ? localP.sellPrice : remoteP.sellPrice,
-          costPrice: localP?.costPrice !== undefined ? localP.costPrice : remoteP.costPrice,
-          totalQuantity: accurateStock
-        });
+        if (hasPendingProd && localP) {
+          finalProductsToSave.push({
+            ...localP,
+            totalQuantity: accurateStock
+          });
+        } else {
+          finalProductsToSave.push({
+            ...remoteP,
+            totalQuantity: accurateStock
+          });
+        }
       }
 
       // Preservar produtos que existem apenas localmente (criados offline)
@@ -1537,16 +1665,14 @@ export const SyncService = {
         }
       }
 
-      // 7. Mesclagem inteligente de Faturas (Preservação estrita das faturas de 11 a 21 de setembro e offline)
-      const currentLocalInvoices = await db.invoices.toArray();
+      // 7. Mesclagem inteligente de Faturas (Correspondência ESTRITAMENTE por ID para evitar colisões)
       const localInvoiceMap = new Map(currentLocalInvoices.map(i => [i.id, i]));
-      const localInvoiceNumMap = new Map(currentLocalInvoices.map(i => [i.invoiceNumber, i]));
       const finalInvoicesToSave: (Invoice & { synchronized?: boolean })[] = [];
       const processedInvoiceIds = new Set<string>();
 
       for (const remoteInv of mappedInvoices) {
         processedInvoiceIds.add(remoteInv.id);
-        const localInv = localInvoiceMap.get(remoteInv.id) || localInvoiceNumMap.get(remoteInv.invoiceNumber);
+        const localInv = localInvoiceMap.get(remoteInv.id);
         
         if (!localInv) {
           // Fatura remota inexistente localmente -> insere
@@ -1572,7 +1698,7 @@ export const SyncService = {
         }
       }
 
-      // Adicionar todas as faturas locais que não vieram no payload do Supabase (ex: período de 11 a 21 de setembro)
+      // Adicionar todas as faturas locais que não vieram no payload do Supabase
       for (const localInv of currentLocalInvoices) {
         if (!processedInvoiceIds.has(localInv.id)) {
           finalInvoicesToSave.push(localInv);
@@ -1641,31 +1767,33 @@ export const SyncService = {
    * Ordem estrita: LOCAL PENDING -> SUPABASE -> CONFIRMAÇÃO -> SUPABASE -> LOCAL (Regra 14)
    */
   async syncAll(): Promise<{ success: boolean; pushed: number; pulled: number; message: string }> {
-    // 1. Processar a fila de operações pendentes (syncQueue) com confirmação individual
-    try {
-      await this.processQueue();
-    } catch (qErr) {
-      console.warn('[syncAll processQueue warning]', qErr);
-    }
+    return withSyncLock(async () => {
+      // 1. Processar a fila de operações pendentes (syncQueue) com confirmação individual
+      try {
+        await this._processQueueInternal();
+      } catch (qErr) {
+        console.warn('[syncAll processQueue warning]', qErr);
+      }
 
-    // 2. Enviar dados pendentes diretos (faturas locais não sincronizadas)
-    let pushRes = { success: false, pushed: 0, message: '' };
-    try {
-      pushRes = await this.pushAllLocalToSupabase();
-    } catch (pushErr: any) {
-      console.warn('[syncAll Push Warning]', pushErr);
-    }
+      // 2. Enviar dados pendentes diretos (faturas locais não sincronizadas)
+      let pushRes = { success: false, pushed: 0, message: '' };
+      try {
+        pushRes = await this._pushAllLocalInternal();
+      } catch (pushErr: any) {
+        console.warn('[syncAll Push Warning]', pushErr);
+      }
 
-    // 3. Buscar os dados atualizados do Supabase preservando dados locais (sem clear())
-    const pullRes = await this.fetchAllFromSupabase();
+      // 3. Buscar os dados atualizados do Supabase preservando dados locais (sem clear())
+      const pullRes = await this._fetchAllFromSupabaseInternal();
 
-    const isSuccess = pushRes.success || pullRes.success;
-    return {
-      success: isSuccess,
-      pushed: pushRes.pushed,
-      pulled: pullRes.pulled,
-      message: `Sincronização concluída! ${pushRes.pushed} registos locais enviados (upload) e ${pullRes.pulled} registos da nuvem recebidos (download).`
-    };
+      const isSuccess = pushRes.success || pullRes.success;
+      return {
+        success: isSuccess,
+        pushed: pushRes.pushed,
+        pulled: pullRes.pulled,
+        message: `Sincronização concluída! ${pushRes.pushed} registos locais enviados (upload) e ${pullRes.pulled} registos da nuvem recebidos (download).`
+      };
+    });
   },
 
   // =========================================================================
@@ -1805,12 +1933,59 @@ export const SyncService = {
     const supabase = getSupabase();
     let createdBatch: Batch | undefined;
 
-    // Remove qualquer tombstone prévio para este ID
     await db.deletedRecords.delete(product.id);
 
+    if (initialBatch && initialBatch.lotNumber.trim()) {
+      createdBatch = {
+        id: safeUUID(),
+        productId: product.id,
+        lotNumber: initialBatch.lotNumber.trim(),
+        expiryDate: initialBatch.expiryDate,
+        quantity: Math.max(0, initialBatch.quantity),
+        entryDate: getTodayAngolaDateKey()
+      };
+      await db.deletedRecords.delete(createdBatch.id);
+    }
+
+    // 1. Salvar imediatamente no Dexie e enfileirar operações na syncQueue (protege contra Realtime/pull)
+    await db.products.put(product);
+    if (createdBatch) {
+      await db.batches.put(createdBatch);
+    }
+
+    const nowIso = new Date().toISOString();
+    const prodOpId = await db.syncQueue.add({
+      operationId: safeUUID(),
+      deviceId: DeviceService.getDeviceId(),
+      entityType: 'PRODUCT',
+      entityId: product.id,
+      operationType: SyncOperationType.CREATE,
+      payload: product,
+      createdAt: nowIso,
+      status: SyncOperationStatus.PENDING,
+      attempts: 0
+    });
+
+    let batchOpId: number | undefined;
+    if (createdBatch) {
+      batchOpId = await db.syncQueue.add({
+        operationId: safeUUID(),
+        deviceId: DeviceService.getDeviceId(),
+        entityType: 'BATCH',
+        entityId: createdBatch.id,
+        operationType: SyncOperationType.CREATE,
+        payload: createdBatch,
+        createdAt: nowIso,
+        status: SyncOperationStatus.PENDING,
+        attempts: 0
+      });
+    }
+
+    this.broadcastLocalChange();
+
+    // 2. Tentar envio online e só marcar SYNCED se confirmado
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
-        // 1. Inserir ou atualizar produto no Supabase (UPSERT)
         const { error: prodErr } = await supabase.from('products').upsert({
           id: product.id,
           code: product.code,
@@ -1826,29 +2001,19 @@ export const SyncService = {
           min_stock: product.minStock,
           total_quantity: product.totalQuantity,
           active: product.active,
-          updated_at: new Date().toISOString()
+          updated_at: nowIso
         }, { onConflict: 'id' });
 
-        if (prodErr) {
-          console.warn('[createProduct Supabase Warning]', prodErr);
-          if (isQuotaExceededError(prodErr)) {
-            this.setQuotaRestricted(true, prodErr.message);
-          }
+        if (!prodErr && prodOpId) {
+          await db.syncQueue.update(prodOpId, {
+            status: SyncOperationStatus.SYNCED,
+            syncedAt: new Date().toISOString()
+          });
+        } else if (prodErr && isQuotaExceededError(prodErr)) {
+          this.setQuotaRestricted(true, prodErr.message);
         }
 
-        // 2. Se houver lote inicial, inserir lote no Supabase
-        if (initialBatch && initialBatch.lotNumber.trim() && !this.isQuotaRestricted()) {
-          createdBatch = {
-            id: safeUUID(),
-            productId: product.id,
-            lotNumber: initialBatch.lotNumber.trim(),
-            expiryDate: initialBatch.expiryDate,
-            quantity: Math.max(0, initialBatch.quantity),
-            entryDate: new Date().toISOString().split('T')[0]
-          };
-
-          await db.deletedRecords.delete(createdBatch.id);
-
+        if (createdBatch && !this.isQuotaRestricted()) {
           const { error: batchErr } = await supabase.from('batches').upsert({
             id: createdBatch.id,
             product_id: createdBatch.productId,
@@ -1858,86 +2023,86 @@ export const SyncService = {
             entry_date: createdBatch.entryDate
           }, { onConflict: 'id' });
 
-          if (batchErr) {
-            console.warn('[createProduct batch Supabase Warning]', batchErr);
-            if (isQuotaExceededError(batchErr)) {
-              this.setQuotaRestricted(true, batchErr.message);
-            }
+          if (!batchErr && batchOpId) {
+            await db.syncQueue.update(batchOpId, {
+              status: SyncOperationStatus.SYNCED,
+              syncedAt: new Date().toISOString()
+            });
+          } else if (batchErr && isQuotaExceededError(batchErr)) {
+            this.setQuotaRestricted(true, batchErr.message);
           }
         }
       } catch (err: any) {
-        console.warn('[createProduct Supabase Fallback]', err?.message || err);
         if (isQuotaExceededError(err)) {
           this.setQuotaRestricted(true, err.message);
         }
       }
     }
-
-    if (!createdBatch && initialBatch && initialBatch.lotNumber.trim()) {
-      createdBatch = {
-        id: safeUUID(),
-        productId: product.id,
-        lotNumber: initialBatch.lotNumber.trim(),
-        expiryDate: initialBatch.expiryDate,
-        quantity: Math.max(0, initialBatch.quantity),
-        entryDate: new Date().toISOString().split('T')[0]
-      };
-      await db.deletedRecords.delete(createdBatch.id);
-    }
-
-    // Salvar simultaneamente no Dexie local
-    await db.products.put(product);
-    if (createdBatch) {
-      await db.batches.put(createdBatch);
-    }
-    this.broadcastLocalChange();
 
     return { product, batch: createdBatch };
   },
 
   async updateProduct(product: Product): Promise<void> {
     const supabase = getSupabase();
-
-    // Remove qualquer tombstone prévio
     await db.deletedRecords.delete(product.id);
+
+    const localBatches = await db.batches.where('productId').equals(product.id).toArray();
+    const authoritativeStock = localBatches.length > 0
+      ? Math.max(0, localBatches.reduce((sum, b) => sum + Math.max(0, Number(b.quantity) || 0), 0))
+      : Math.max(0, Number(product.totalQuantity) || 0);
+    const syncedProduct: Product = { ...product, totalQuantity: authoritativeStock };
+
+    await db.products.put(syncedProduct);
+
+    const nowIso = new Date().toISOString();
+    const opId = await db.syncQueue.add({
+      operationId: safeUUID(),
+      deviceId: DeviceService.getDeviceId(),
+      entityType: 'PRODUCT',
+      entityId: syncedProduct.id,
+      operationType: SyncOperationType.UPDATE,
+      payload: syncedProduct,
+      createdAt: nowIso,
+      status: SyncOperationStatus.PENDING,
+      attempts: 0
+    });
+
+    this.broadcastLocalChange();
 
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
         const { error } = await supabase.from('products').upsert({
-          id: product.id,
-          code: product.code,
-          name: product.name,
-          active_ingredient: product.activeIngredient,
-          category: product.category,
-          type: product.type || null,
-          price_type: product.priceType,
-          cost_price: product.costPrice,
-          sell_price: product.sellPrice,
-          has_vat: product.hasVAT,
-          supplier: product.supplier || null,
-          min_stock: product.minStock,
-          total_quantity: product.totalQuantity,
-          active: product.active,
-          updated_at: new Date().toISOString()
+          id: syncedProduct.id,
+          code: syncedProduct.code,
+          name: syncedProduct.name,
+          active_ingredient: syncedProduct.activeIngredient,
+          category: syncedProduct.category,
+          type: syncedProduct.type || null,
+          price_type: syncedProduct.priceType,
+          cost_price: syncedProduct.costPrice,
+          sell_price: syncedProduct.sellPrice,
+          has_vat: syncedProduct.hasVAT,
+          supplier: syncedProduct.supplier || null,
+          min_stock: syncedProduct.minStock,
+          total_quantity: syncedProduct.totalQuantity,
+          active: syncedProduct.active,
+          updated_at: nowIso
         }, { onConflict: 'id' });
 
-        if (error) {
-          console.warn('[updateProduct Supabase Warning]', error);
-          if (isQuotaExceededError(error)) {
-            this.setQuotaRestricted(true, error.message);
-          }
+        if (!error && opId) {
+          await db.syncQueue.update(opId, {
+            status: SyncOperationStatus.SYNCED,
+            syncedAt: new Date().toISOString()
+          });
+        } else if (error && isQuotaExceededError(error)) {
+          this.setQuotaRestricted(true, error.message);
         }
       } catch (err: any) {
-        console.warn('[updateProduct Supabase Fallback]', err?.message || err);
         if (isQuotaExceededError(err)) {
           this.setQuotaRestricted(true, err.message);
         }
       }
     }
-
-    // Salvar simultaneamente no Dexie local
-    await db.products.put(product);
-    this.broadcastLocalChange();
   },
 
   /**
@@ -2022,106 +2187,182 @@ export const SyncService = {
 
   async createBatch(batch: Batch): Promise<void> {
     const supabase = getSupabase();
-
-    // Remove qualquer tombstone prévio
     await db.deletedRecords.delete(batch.id);
 
+    const sanitizedBatch: Batch = {
+      ...batch,
+      quantity: Math.max(0, Number(batch.quantity) || 0)
+    };
+
+    // 1. Gravar imediatamente no Dexie local e recalcular stock total do produto
+    await db.batches.put(sanitizedBatch);
+    const localBatches = await db.batches.where('productId').equals(sanitizedBatch.productId).toArray();
+    const newTotal = localBatches.reduce((acc, b) => acc + Math.max(0, Number(b.quantity) || 0), 0);
+    const prod = await db.products.get(sanitizedBatch.productId);
+    if (prod) {
+      prod.totalQuantity = newTotal;
+      await db.products.put(prod);
+    }
+
+    const nowIso = new Date().toISOString();
+    const batchOpId = await db.syncQueue.add({
+      operationId: safeUUID(),
+      deviceId: DeviceService.getDeviceId(),
+      entityType: 'BATCH',
+      entityId: sanitizedBatch.id,
+      operationType: SyncOperationType.CREATE,
+      payload: sanitizedBatch,
+      createdAt: nowIso,
+      status: SyncOperationStatus.PENDING,
+      attempts: 0
+    });
+
+    let prodOpId: number | undefined;
+    if (prod) {
+      prodOpId = await db.syncQueue.add({
+        operationId: safeUUID(),
+        deviceId: DeviceService.getDeviceId(),
+        entityType: 'PRODUCT',
+        entityId: prod.id,
+        operationType: SyncOperationType.UPDATE,
+        payload: prod,
+        createdAt: nowIso,
+        status: SyncOperationStatus.PENDING,
+        attempts: 0
+      });
+    }
+
+    this.broadcastLocalChange();
+
+    // 2. Tentar enviar para o Supabase e confirmar na fila
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
-        // 1. Inserir lote no Supabase
         const { error: batchErr } = await supabase.from('batches').upsert({
-          id: batch.id,
-          product_id: batch.productId,
-          lot_number: batch.lotNumber,
-          expiry_date: batch.expiryDate,
-          quantity: Math.max(0, batch.quantity),
-          entry_date: batch.entryDate
+          id: sanitizedBatch.id,
+          product_id: sanitizedBatch.productId,
+          lot_number: sanitizedBatch.lotNumber,
+          expiry_date: sanitizedBatch.expiryDate,
+          quantity: sanitizedBatch.quantity,
+          entry_date: sanitizedBatch.entryDate
         }, { onConflict: 'id' });
 
-        if (batchErr) {
-          console.warn('[createBatch Supabase Warning]', batchErr);
-          if (isQuotaExceededError(batchErr)) {
-            this.setQuotaRestricted(true, batchErr.message);
-          }
+        if (!batchErr && batchOpId) {
+          await db.syncQueue.update(batchOpId, {
+            status: SyncOperationStatus.SYNCED,
+            syncedAt: new Date().toISOString()
+          });
+        } else if (batchErr && isQuotaExceededError(batchErr)) {
+          this.setQuotaRestricted(true, batchErr.message);
         }
 
-        // 2. Recalcular stock total do produto no Supabase
-        if (!this.isQuotaRestricted()) {
-          try {
-            const { data: allBatches } = await supabase.from('batches').select('quantity').eq('product_id', batch.productId);
-            const newTotal = (allBatches || []).reduce((acc, b) => acc + Math.max(0, Number(b.quantity) || 0), 0);
-            await supabase.from('products').update({ total_quantity: newTotal }).eq('id', batch.productId);
-          } catch (pUpErr) {}
+        if (!this.isQuotaRestricted() && prod) {
+          const { error: prodErr } = await supabase
+            .from('products')
+            .update({ total_quantity: newTotal })
+            .eq('id', sanitizedBatch.productId);
+          if (!prodErr && prodOpId) {
+            await db.syncQueue.update(prodOpId, {
+              status: SyncOperationStatus.SYNCED,
+              syncedAt: new Date().toISOString()
+            });
+          }
         }
       } catch (err: any) {
-        console.warn('[createBatch Supabase Fallback]', err?.message || err);
         if (isQuotaExceededError(err)) {
           this.setQuotaRestricted(true, err.message);
         }
       }
     }
-
-    // Gravar simultaneamente no Dexie local
-    await db.batches.put(batch);
-    const prod = await db.products.get(batch.productId);
-    if (prod) {
-      const localBatches = await db.batches.where('productId').equals(batch.productId).toArray();
-      prod.totalQuantity = localBatches.reduce((acc, b) => acc + Math.max(0, Number(b.quantity) || 0), 0);
-      await db.products.put(prod);
-    }
-    this.broadcastLocalChange();
   },
 
   async updateBatch(batch: Batch): Promise<void> {
     const supabase = getSupabase();
-
-    // Remove qualquer tombstone prévio
     await db.deletedRecords.delete(batch.id);
 
+    const sanitizedBatch: Batch = {
+      ...batch,
+      quantity: Math.max(0, Number(batch.quantity) || 0)
+    };
+
+    // 1. Gravar imediatamente no Dexie local e recalcular stock total do produto
+    await db.batches.put(sanitizedBatch);
+    const localBatches = await db.batches.where('productId').equals(sanitizedBatch.productId).toArray();
+    const newTotal = localBatches.reduce((acc, b) => acc + Math.max(0, Number(b.quantity) || 0), 0);
+    const prod = await db.products.get(sanitizedBatch.productId);
+    if (prod) {
+      prod.totalQuantity = newTotal;
+      await db.products.put(prod);
+    }
+
+    const nowIso = new Date().toISOString();
+    const batchOpId = await db.syncQueue.add({
+      operationId: safeUUID(),
+      deviceId: DeviceService.getDeviceId(),
+      entityType: 'BATCH',
+      entityId: sanitizedBatch.id,
+      operationType: SyncOperationType.UPDATE,
+      payload: sanitizedBatch,
+      createdAt: nowIso,
+      status: SyncOperationStatus.PENDING,
+      attempts: 0
+    });
+
+    let prodOpId: number | undefined;
+    if (prod) {
+      prodOpId = await db.syncQueue.add({
+        operationId: safeUUID(),
+        deviceId: DeviceService.getDeviceId(),
+        entityType: 'PRODUCT',
+        entityId: prod.id,
+        operationType: SyncOperationType.UPDATE,
+        payload: prod,
+        createdAt: nowIso,
+        status: SyncOperationStatus.PENDING,
+        attempts: 0
+      });
+    }
+
+    this.broadcastLocalChange();
+
+    // 2. Tentar enviar para o Supabase e confirmar na fila
     if (this.isConfigured() && supabase && !this.isQuotaRestricted()) {
       try {
-        // 1. Atualizar lote no Supabase
         const { error: batchErr } = await supabase.from('batches').upsert({
-          id: batch.id,
-          product_id: batch.productId,
-          lot_number: batch.lotNumber,
-          expiry_date: batch.expiryDate,
-          quantity: Math.max(0, batch.quantity),
-          entry_date: batch.entryDate
+          id: sanitizedBatch.id,
+          product_id: sanitizedBatch.productId,
+          lot_number: sanitizedBatch.lotNumber,
+          expiry_date: sanitizedBatch.expiryDate,
+          quantity: sanitizedBatch.quantity,
+          entry_date: sanitizedBatch.entryDate
         }, { onConflict: 'id' });
 
-        if (batchErr) {
-          console.warn('[updateBatch Supabase Warning]', batchErr);
-          if (isQuotaExceededError(batchErr)) {
-            this.setQuotaRestricted(true, batchErr.message);
-          }
+        if (!batchErr && batchOpId) {
+          await db.syncQueue.update(batchOpId, {
+            status: SyncOperationStatus.SYNCED,
+            syncedAt: new Date().toISOString()
+          });
+        } else if (batchErr && isQuotaExceededError(batchErr)) {
+          this.setQuotaRestricted(true, batchErr.message);
         }
 
-        // 2. Recalcular stock total do produto no Supabase
-        if (!this.isQuotaRestricted()) {
-          try {
-            const { data: allBatches } = await supabase.from('batches').select('quantity').eq('product_id', batch.productId);
-            const newTotal = (allBatches || []).reduce((acc, b) => acc + Math.max(0, Number(b.quantity) || 0), 0);
-            await supabase.from('products').update({ total_quantity: newTotal }).eq('id', batch.productId);
-          } catch (pUpErr) {}
+        if (!this.isQuotaRestricted() && prod) {
+          const { error: prodErr } = await supabase
+            .from('products')
+            .update({ total_quantity: newTotal })
+            .eq('id', sanitizedBatch.productId);
+          if (!prodErr && prodOpId) {
+            await db.syncQueue.update(prodOpId, {
+              status: SyncOperationStatus.SYNCED,
+              syncedAt: new Date().toISOString()
+            });
+          }
         }
       } catch (err: any) {
-        console.warn('[updateBatch Supabase Fallback]', err?.message || err);
         if (isQuotaExceededError(err)) {
           this.setQuotaRestricted(true, err.message);
         }
       }
     }
-
-    // Gravar simultaneamente no Dexie local
-    await db.batches.put(batch);
-    const prod = await db.products.get(batch.productId);
-    if (prod) {
-      const localBatches = await db.batches.where('productId').equals(batch.productId).toArray();
-      prod.totalQuantity = localBatches.reduce((acc, b) => acc + Math.max(0, Number(b.quantity) || 0), 0);
-      await db.products.put(prod);
-    }
-    this.broadcastLocalChange();
   },
 
   async deleteBatch(batchId: string, userId?: string): Promise<void> {
@@ -2589,9 +2830,9 @@ export const SyncService = {
               }).eq('id', invoiceId);
             } catch (invUpErr) {}
           } else {
-            const newGross = remainingItems.reduce((sum, it) => sum + it.subtotal, 0);
-            const newVAT = remainingItems.reduce((sum, it) => sum + it.vatAmount, 0);
-            const newNet = newGross + newVAT;
+            const newGross = roundMoney(remainingItems.reduce((sum, it) => sum + (Number(it.subtotal) || 0), 0));
+            const newVAT = roundMoney(remainingItems.reduce((sum, it) => sum + (Number(it.vatAmount) || 0), 0));
+            const newNet = roundMoney(newGross + newVAT);
 
             try {
               await supabase.from('invoices').update({
@@ -2643,10 +2884,11 @@ export const SyncService = {
       invoice.totalNet = 0;
     } else {
       invoice.items = remainingItems;
-      invoice.totalGross = remainingItems.reduce((sum, it) => sum + it.subtotal, 0);
-      invoice.totalVAT = remainingItems.reduce((sum, it) => sum + it.vatAmount, 0);
-      invoice.totalNet = invoice.totalGross + invoice.totalVAT;
+      invoice.totalGross = roundMoney(remainingItems.reduce((sum, it) => sum + (Number(it.subtotal) || 0), 0));
+      invoice.totalVAT = roundMoney(remainingItems.reduce((sum, it) => sum + (Number(it.vatAmount) || 0), 0));
+      invoice.totalNet = roundMoney(invoice.totalGross + invoice.totalVAT);
     }
+    invoice.synchronized = !this.isQuotaRestricted();
     await db.invoices.put(invoice);
     this.broadcastLocalChange();
   },
@@ -2952,8 +3194,7 @@ export const SyncService = {
    * Libera e dá início imediato às vendas do novo dia (1º Turno).
    */
   async performAutoMidnightClosureIfNeeded(): Promise<{ closedDaysCount: number; closuresCreated: DailyClosure[] }> {
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
+    const todayStr = getTodayAngolaDateKey();
 
     const unclosedInvoices = await db.invoices
       .filter(inv => !inv.closed && inv.status !== InvoiceStatus.CANCELLED)
@@ -2965,7 +3206,7 @@ export const SyncService = {
 
     const invoicesByDate: Record<string, Invoice[]> = {};
     for (const inv of unclosedInvoices) {
-      const invDate = (inv.date || '').split('T')[0];
+      const invDate = getAngolaDateKey(inv.date);
       if (!invDate) continue;
       if (invDate < todayStr) {
         if (!invoicesByDate[invDate]) {
@@ -2980,7 +3221,7 @@ export const SyncService = {
       return { closedDaysCount: 0, closuresCreated: [] };
     }
 
-    console.log(`[AutoMidnightClosure] A detetar ${pastDates.length} dia(s) anterior(es) pendente(s) de fecho às 00:00:`, pastDates);
+    console.log(`[AutoMidnightClosure] A detetar ${pastDates.length} dia(s) anterior(es) pendente(s) de fecho às 00:00 (Angola):`, pastDates);
 
     const closuresCreated: DailyClosure[] = [];
 
@@ -2991,11 +3232,7 @@ export const SyncService = {
       const shiftsFound = Array.from(new Set(dayInvoices.map(i => i.shiftNumber || 1))).sort((a, b) => a - b);
       const shiftBreakdowns = shiftsFound.map(shiftNum => {
         const sInvs = dayInvoices.filter(i => (i.shiftNumber || 1) === shiftNum);
-        const sCash = sInvs.filter(i => i.paymentMethod === 'Numerário' || i.paymentMethod === 'Dinheiro').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-        const sTpa = sInvs.filter(i => i.paymentMethod === 'Multicaixa' || i.paymentMethod === 'TPA' || i.paymentMethod === 'Cartão').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-        const sTransfer = sInvs.filter(i => i.paymentMethod === 'Transferência').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-        const sMixed = sInvs.filter(i => i.paymentMethod === 'Misto').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-        const sTotal = sCash + sTpa + sTransfer + sMixed;
+        const sSums = summarizeInvoicesByPayment(sInvs);
         const shiftName = sInvs[0]?.shiftName || `${shiftNum}º Turno`;
         const operator = sInvs[sInvs.length - 1]?.userName || 'Sistema (Fecho Automático 00:00)';
 
@@ -3004,26 +3241,19 @@ export const SyncService = {
           shiftName,
           operator,
           totalInvoices: sInvs.length,
-          totalCash: sCash,
-          totalTpa: sTpa,
-          totalTransfer: sTransfer,
-          totalMixed: sMixed,
-          grandTotal: sTotal,
-          closedAt: `${pastDate}T23:59:59.999Z`
+          totalCash: sSums.cash,
+          totalTpa: sSums.tpa,
+          totalTransfer: sSums.transfer,
+          totalMixed: sSums.mixed,
+          grandTotal: sSums.total,
+          closedAt: `${pastDate}T22:59:59.000Z`
         };
       });
 
-      const totalCash = dayInvoices.filter(i => i.paymentMethod === 'Numerário' || i.paymentMethod === 'Dinheiro').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-      const totalTpa = dayInvoices.filter(i => i.paymentMethod === 'Multicaixa' || i.paymentMethod === 'TPA' || i.paymentMethod === 'Cartão').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-      const totalTransfer = dayInvoices.filter(i => i.paymentMethod === 'Transferência').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-      const totalMixed = dayInvoices.filter(i => i.paymentMethod === 'Misto').reduce((s, i) => s + (Number(i.totalNet) || 0), 0);
-      const grandTotal = totalCash + totalTpa + totalTransfer + totalMixed;
-
-      // Chave determinística para evitar duplicatas em múltiplos computadores (Regra 34)
+      const daySums = summarizeInvoicesByPayment(dayInvoices);
       const deterministicClosureId = `CLOSURE_${pastDate}_GENERAL_1`;
       const existingClosure = await db.dailyClosures.get(deterministicClosureId);
       if (existingClosure) {
-        // Já foi fechado por outro terminal ou em execução prévia
         for (const inv of dayInvoices) {
           await db.invoices.update(inv.id, {
             closed: true,
@@ -3043,13 +3273,13 @@ export const SyncService = {
         type: 'GENERAL',
         shiftNumber: 1,
         shiftName: 'Fecho Geral Automático 00:00',
-        totalCash,
-        totalTpa,
-        totalTransfer,
-        totalMixed,
+        totalCash: daySums.cash,
+        totalTpa: daySums.tpa,
+        totalTransfer: daySums.transfer,
+        totalMixed: daySums.mixed,
         totalInvoices: dayInvoices.length,
-        grandTotal,
-        timestamp: `${pastDate}T23:59:59.999Z`,
+        grandTotal: daySums.total,
+        timestamp: `${pastDate}T22:59:59.000Z`,
         shiftBreakdowns
       };
 
@@ -3076,6 +3306,111 @@ export const SyncService = {
       closedDaysCount: closuresCreated.length,
       closuresCreated
     };
+  },
+
+  /**
+   * Auditoria e reparação idempotente de faturas e fechos históricos afetados pelo antigo bug de subtração de IVA
+   * ou omissão de "Multicaixa (TPA)" em fechos automáticos, garantindo que soma dos medicamentos === total da fatura === fecho.
+   */
+  async repairInconsistentTotalsIfNeeded(): Promise<{ repairedInvoices: number; repairedClosures: number }> {
+    let repairedInvoices = 0;
+    let repairedClosures = 0;
+
+    try {
+      const allInvoices = await db.invoices.toArray();
+      const invoicesToUpdate: (Invoice & { synchronized?: boolean })[] = [];
+
+      for (const inv of allInvoices) {
+        if (!inv.items || inv.items.length === 0) continue;
+
+        let sumSubtotal = 0;
+        let sumVAT = 0;
+        for (const it of inv.items) {
+          const qty = Number(it.quantity) || 0;
+          const unitPrice = Number(it.unitPrice) || 0;
+          const sub = it.subtotal !== undefined ? roundMoney(it.subtotal) : roundMoney(qty * unitPrice);
+          const vat = roundMoney(it.vatAmount);
+          sumSubtotal += sub;
+          sumVAT += vat;
+        }
+        sumSubtotal = roundMoney(sumSubtotal);
+        sumVAT = roundMoney(sumVAT);
+        const expectedNet = roundMoney(sumSubtotal + sumVAT);
+
+        // Deteta o bug exato antigo de SaleService (totalGross = subtotal - vatAmount, totalNet = subtotal)
+        // OU divergência de soma de linhas vs totalNet quando os itens têm subtotal/IVA completos
+        const hasSubtractionBugSignature =
+          sumVAT > 0 &&
+          Math.abs((Number(inv.totalGross) || 0) - sumSubtotal) > 0.05 &&
+          Math.abs(((Number(inv.totalGross) || 0) + (Number(inv.totalVAT) || 0)) - sumSubtotal) <= 0.5;
+
+        const hasLineTotalMismatch =
+          inv.status === InvoiceStatus.ISSUED &&
+          Math.abs((Number(inv.totalNet) || 0) - expectedNet) > 0.05 &&
+          Math.abs((Number(inv.totalGross) || 0) + (Number(inv.totalVAT) || 0) - sumSubtotal) <= 0.5;
+
+        if (hasSubtractionBugSignature || hasLineTotalMismatch) {
+          invoicesToUpdate.push({
+            ...inv,
+            totalGross: sumSubtotal,
+            totalVAT: sumVAT,
+            totalNet: expectedNet,
+            synchronized: false
+          });
+        }
+      }
+
+      if (invoicesToUpdate.length > 0) {
+        await db.invoices.bulkPut(invoicesToUpdate);
+        repairedInvoices = invoicesToUpdate.length;
+      }
+
+      // Reparar fechos cujos valores divergem das respetivas faturas associadas (ex: Multicaixa (TPA) omitida)
+      const latestInvoices = repairedInvoices > 0 ? await db.invoices.toArray() : allInvoices;
+      const allClosures = await db.dailyClosures.toArray();
+      const closuresToUpdate: DailyClosure[] = [];
+
+      for (const c of allClosures) {
+        const linked = latestInvoices.filter(
+          inv => inv.closureId === c.id && inv.status !== InvoiceStatus.CANCELLED
+        );
+        if (linked.length === 0) continue;
+
+        const sums = summarizeInvoicesByPayment(linked);
+        const storedSum = roundMoney((c.totalCash || 0) + (c.totalTpa || 0) + (c.totalTransfer || 0) + (c.totalMixed || 0));
+        const needsUpdate =
+          Math.abs((c.grandTotal || 0) - sums.total) > 0.05 ||
+          Math.abs(storedSum - sums.total) > 0.05 ||
+          Math.abs((c.totalTpa || 0) - sums.tpa) > 0.05 ||
+          Math.abs((c.totalCash || 0) - sums.cash) > 0.05;
+
+        if (needsUpdate) {
+          closuresToUpdate.push({
+            ...c,
+            totalCash: sums.cash,
+            totalTpa: sums.tpa,
+            totalTransfer: sums.transfer,
+            totalMixed: sums.mixed,
+            totalInvoices: linked.length,
+            grandTotal: sums.total,
+            synchronized: false
+          });
+        }
+      }
+
+      if (closuresToUpdate.length > 0) {
+        await db.dailyClosures.bulkPut(closuresToUpdate);
+        repairedClosures = closuresToUpdate.length;
+      }
+
+      if (repairedInvoices > 0 || repairedClosures > 0) {
+        this.broadcastLocalChange();
+      }
+    } catch (repairErr) {
+      console.warn('[repairInconsistentTotalsIfNeeded Warning]', repairErr);
+    }
+
+    return { repairedInvoices, repairedClosures };
   },
 
   async createClosure(closure: DailyClosure, closedInvoices: Invoice[]): Promise<void> {
@@ -3132,7 +3467,7 @@ export const SyncService = {
     }
 
     // Gravar simultaneamente no Dexie local
-    await db.dailyClosures.put(closure);
+    await db.dailyClosures.put({ ...closure, synchronized: !this.isQuotaRestricted() });
     for (const inv of closedInvoices) {
       await db.invoices.put({ ...inv, synchronized: !this.isQuotaRestricted() });
     }

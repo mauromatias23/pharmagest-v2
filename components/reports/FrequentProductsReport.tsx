@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { Invoice, Product } from '../../types';
 import { FinancialService } from '../../services/financialService';
+import { getAngolaDateKey, getTodayAngolaDateKey } from '../../utils/financeUtils';
 import { COMPANY_INFO } from '../../constants';
 import { 
   Search, 
@@ -19,9 +20,9 @@ interface FrequentProductsReportProps {
 }
 
 export const FrequentProductsReport: React.FC<FrequentProductsReportProps> = ({ invoices, products }) => {
-  // Datas padrão: Últimos 30 dias até hoje
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const thirtyDaysAgoStr = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  // Datas padrão: Últimos 30 dias até hoje (calendário de Angola)
+  const todayStr = getTodayAngolaDateKey();
+  const thirtyDaysAgoStr = getAngolaDateKey(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
 
   const [startDate, setStartDate] = useState(thirtyDaysAgoStr);
   const [endDate, setEndDate] = useState(todayStr);
@@ -32,16 +33,19 @@ export const FrequentProductsReport: React.FC<FrequentProductsReportProps> = ({ 
 
   // Atalhos de período
   const handleQuickPeriod = (days: number) => {
-    const end = new Date().toISOString().slice(0, 10);
-    const start = new Date(Date.now() - (days - 1) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const end = getTodayAngolaDateKey();
+    const start = getAngolaDateKey(new Date(Date.now() - (days - 1) * 24 * 60 * 60 * 1000));
     setStartDate(start);
     setEndDate(end);
   };
 
   const handleMonthPeriod = () => {
-    const now = new Date();
-    const firstDay = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
-    const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
+    const todayAngola = getTodayAngolaDateKey();
+    const year = parseInt(todayAngola.slice(0, 4), 10);
+    const month = parseInt(todayAngola.slice(5, 7), 10);
+    const firstDay = `${todayAngola.slice(0, 7)}-01`;
+    const lastDayNum = new Date(year, month, 0).getDate();
+    const lastDay = `${todayAngola.slice(0, 7)}-${String(lastDayNum).padStart(2, '0')}`;
     setStartDate(firstDay);
     setEndDate(lastDay);
   };

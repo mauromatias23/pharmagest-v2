@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Expense, ExpenseCategory, User, UserRole } from '../../types';
 import { FinancialService } from '../../services/financialService';
+import { getTodayAngolaDateKey } from '../../utils/financeUtils';
 import { DeviceService } from '../../services/deviceService';
 import { COMPANY_INFO } from '../../constants';
 import { 
@@ -57,10 +58,9 @@ export const ExpensesReport: React.FC<ExpensesReportProps> = ({ user }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('TODAS');
   
-  // Datas padrão: mês atual
-  const now = new Date();
-  const firstDayStr = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
-  const todayStr = now.toISOString().slice(0, 10);
+  // Datas padrão: mês atual no calendário de Angola
+  const todayStr = getTodayAngolaDateKey();
+  const firstDayStr = `${todayStr.slice(0, 7)}-01`;
 
   const [startDate, setStartDate] = useState(firstDayStr);
   const [endDate, setEndDate] = useState(todayStr);
